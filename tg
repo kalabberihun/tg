@@ -171,7 +171,7 @@ def get_user_aura(user_id: int) -> int:
 
 
 async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_TYPE, conf_id: int) -> None:
-    """Sends each comment as a separate message with vote and reply buttons."""
+    """Sends each comment as a separate message with vote and reply buttons, keeping track of reply threads."""
     query = update.callback_query
     
     conf_key = str(conf_id)
@@ -195,7 +195,8 @@ async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_T
     if query:
         await query.answer("Loading comments...")
         
-    alias_map = {r["reply_id"]: r.get("user_alias", "Anonymous") for r in replies}
+    sent_message_ids = {}
+    confession_author_id = conf_data.get("from_user")
     
     for r in replies:
         r_id = r["reply_id"]
@@ -209,11 +210,12 @@ async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_T
         likes = sum(1 for v in voters.values() if v == 'like')
         dislikes = sum(1 for v in voters.values() if v == 'dislike')
         
-        if p_id:
-            p_alias = alias_map.get(p_id, "Anonymous")
-            text = f"💬 (to {p_alias}): {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+        if commenter_id and commenter_id == confession_author_id:
+            commenter_alias_str = "✅ _Confession Author_"
         else:
-            text = f"💬 {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+            commenter_alias_str = f"_{commenter_alias}_"
+            
+        text = f"💬 {comment_text}\n\n👤 {commenter_alias_str} ⚡️ {commenter_aura} Aura"
             
         keyboard = [
             [
@@ -223,7 +225,27 @@ async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_T
             ]
         ]
         
-        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_to_msg_id = None
+        if p_id and p_id in sent_message_ids:
+            reply_to_msg_id = sent_message_ids[p_id]
+            
+        try:
+            sent_msg = await update.effective_message.reply_text(
+                text, 
+                parse_mode="Markdown", 
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                reply_to_message_id=reply_to_msg_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send native comment reply message, falling back: {e}")
+            sent_msg = await update.effective_message.reply_text(
+                text, 
+                parse_mode="Markdown", 
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        if sent_msg:
+            sent_message_ids[r_id] = sent_msg.message_id
 
 
 def get_confession_options_text(conf_id: int) -> str:
@@ -814,22 +836,19 @@ async def handle_callbacks(update: Update,
             likes = sum(1 for v in voters.values() if v == 'like')
             dislikes = sum(1 for v in voters.values() if v == 'dislike')
             
+            conf_data = store["posted"][conf_key]
+            confession_author_id = conf_data.get("from_user")
             commenter_id = target_reply.get("user_id")
             commenter_aura = get_user_aura(commenter_id) if commenter_id else 0
             commenter_alias = target_reply.get("user_alias", "Anonymous")
             
-            comment_text = target_reply.get("text", "")
-            p_id = target_reply.get("reply_to_id")
-            
-            if p_id:
-                p_alias = "Anonymous"
-                for r in replies:
-                    if r.get("reply_id") == p_id:
-                        p_alias = r.get("user_alias", "Anonymous")
-                        break
-                text = f"💬 (to {p_alias}): {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+            if commenter_id and commenter_id == confession_author_id:
+                commenter_alias_str = "✅ _Confession Author_"
             else:
-                text = f"💬 {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+                commenter_alias_str = f"_{commenter_alias}_"
+                
+            comment_text = target_reply.get("text", "")
+            text = f"💬 {comment_text}\n\n👤 {commenter_alias_str} ⚡️ {commenter_aura} Aura"
                 
             keyboard = [
                 [
