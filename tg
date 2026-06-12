@@ -157,6 +157,75 @@ def get_user_alias(user_id: int) -> str:
         return store["user_profiles"].get(user_id_str, "Anonymous")
 
 
+def get_user_aura(user_id: int) -> int:
+    """Calculates the net votes (likes - dislikes) for all comments by a user."""
+    aura = 0
+    for conf in store.get("posted", {}).values():
+        for reply in conf.get("replies", []):
+            if reply.get("user_id") == user_id:
+                voters = reply.get("voters", {})
+                likes = sum(1 for v in voters.values() if v == 'like')
+                dislikes = sum(1 for v in voters.values() if v == 'dislike')
+                aura += (likes - dislikes)
+    return aura
+
+
+async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_TYPE, conf_id: int) -> None:
+    """Sends each comment as a separate message with vote and reply buttons."""
+    query = update.callback_query
+    
+    conf_key = str(conf_id)
+    if conf_key not in store["posted"]:
+        if query:
+            await query.answer("⚠️ Confession not found.")
+        else:
+            await update.effective_message.reply_text("⚠️ Confession not found.")
+        return
+        
+    conf_data = store["posted"][conf_key]
+    replies = conf_data.get("replies", [])
+    
+    if not replies:
+        if query:
+            await query.answer("💬 No comments yet on this confession.")
+        else:
+            await update.effective_message.reply_text("💬 No comments yet on this confession.")
+        return
+        
+    if query:
+        await query.answer("Loading comments...")
+        
+    alias_map = {r["reply_id"]: r.get("user_alias", "Anonymous") for r in replies}
+    
+    for r in replies:
+        r_id = r["reply_id"]
+        commenter_id = r.get("user_id")
+        commenter_aura = get_user_aura(commenter_id) if commenter_id else 0
+        commenter_alias = r.get("user_alias", "Anonymous")
+        comment_text = r.get("text", "")
+        p_id = r.get("reply_to_id")
+        
+        voters = r.get("voters", {})
+        likes = sum(1 for v in voters.values() if v == 'like')
+        dislikes = sum(1 for v in voters.values() if v == 'dislike')
+        
+        if p_id:
+            p_alias = alias_map.get(p_id, "Anonymous")
+            text = f"💬 (to {p_alias}): {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+        else:
+            text = f"💬 {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+            
+        keyboard = [
+            [
+                InlineKeyboardButton(f"👍 {likes}", callback_data=f"like_comment|{conf_id}|{r_id}"),
+                InlineKeyboardButton(f"👎 {dislikes}", callback_data=f"dislike_comment|{conf_id}|{r_id}"),
+                InlineKeyboardButton("Reply", callback_data=f"reply_comment|{conf_id}|{r_id}")
+            ]
+        ]
+        
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 def get_confession_options_text(conf_id: int) -> str:
         """Generates the full text for the main confession view."""
         confession_data = store["posted"].get(str(conf_id))
@@ -176,110 +245,16 @@ def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
         replies_count = len(confession_data.get("replies", [])) if confession_data else 0
         keyboard = [
             [
-                InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}"),
-                InlineKeyboardButton(f"💬 View Comments ({replies_count})", callback_data=f"browse_comments|{conf_id}")
+                InlineKeyboardButton("➕ Add Comment", callback_data=f"add_comment|{conf_id}")
+            ],
+            [
+                InlineKeyboardButton(f"💬 Browse Comments ({replies_count})", callback_data=f"browse_comments|{conf_id}")
             ]
         ]
         return InlineKeyboardMarkup(keyboard)
 
 
-def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Generates a clean, hierarchical list of comments for a confession."""
-    confession_data = store["posted"].get(str(conf_id))
-    if not confession_data:
-        return "⚠️ Confession not found.", None
-
-    replies = confession_data.get("replies", [])
-    
-    # Build parent-child relationships and find root parents
-    parent_map = {r["reply_id"]: r.get("reply_to_id") for r in replies if r.get("reply_to_id")}
-    
-    def get_root(r_id):
-        current = r_id
-        while current in parent_map and parent_map[current] is not None:
-            current = parent_map[current]
-        return current
-        
-    top_level = []
-    descendants = {} # root_id -> list of reply dicts
-    
-    for r in replies:
-        r_id = r["reply_id"]
-        p_id = r.get("reply_to_id")
-        if p_id is None:
-            top_level.append(r)
-        else:
-            root_id = get_root(r_id)
-            if root_id not in descendants:
-                descendants[root_id] = []
-            descendants[root_id].append(r)
-            
-    # Assign sequential numbers while traversing DFS
-    display_comments = []
-    alias_map = {r["reply_id"]: r.get("user_alias", "Anonymous") for r in replies}
-    current_num = 1
-    
-    for r in top_level:
-        display_comments.append((current_num, 0, r))
-        r_id = r["reply_id"]
-        current_num += 1
-        
-        if r_id in descendants:
-            children_of_parent = {}
-            for child in descendants[r_id]:
-                cp_id = child.get("reply_to_id")
-                if cp_id not in children_of_parent:
-                    children_of_parent[cp_id] = []
-                children_of_parent[cp_id].append(child)
-                
-            def add_children(parent_id, depth):
-                nonlocal current_num
-                if parent_id in children_of_parent:
-                    for child in children_of_parent[parent_id]:
-                        display_comments.append((current_num, depth, child))
-                        current_num += 1
-                        add_children(child["reply_id"], depth + 1)
-                        
-            add_children(r_id, 1)
-
-    text = f"💬 *Comments on #{conf_id}:*\n\n"
-    if not display_comments:
-        text += "_No comments yet._\n"
-    else:
-        for num, depth, r in display_comments:
-            alias = r.get("user_alias", "Anonymous")
-            comment_text = r.get("text", "")
-            p_id = r.get("reply_to_id")
-            
-            indent = "   " * depth
-            prefix = "↳ " if depth > 0 else ""
-            
-            if p_id:
-                p_alias = alias_map.get(p_id, "Anonymous")
-                text += f"{indent}{prefix}{num}. *{alias}* (to *{p_alias}*): {comment_text}\n"
-            else:
-                text += f"{num}. *{alias}*: {comment_text}\n"
-
-    keyboard = []
-    keyboard.append([InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}")])
-    
-    # Add a reply button for each comment in the thread
-    reply_buttons = []
-    for num, depth, r in display_comments:
-        r_id = r["reply_id"]
-        reply_buttons.append(
-            InlineKeyboardButton(f"💬 Reply to {num}", callback_data=f"reply_comment|{conf_id}|{r_id}")
-        )
-    
-    # Chunk reply buttons into rows of 3
-    for i in range(0, len(reply_buttons), 3):
-        keyboard.append(reply_buttons[i:i+3])
-        
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back to Confession", callback_data=f"view_confession|{conf_id}"),
-        InlineKeyboardButton("❌ Close", callback_data="cancel_comment_flow")
-    ])
-    return text, InlineKeyboardMarkup(keyboard)
+# get_comment_page_text_and_markup is deprecated and replaced by browse_comments_action
 
 
 async def send_confession_options(update: Update,
@@ -393,7 +368,37 @@ async def start_command(update: Update,
                     await send_confession_options(update, context, conf_id)
                     return
                 except (IndexError, ValueError) as e:
-                    logger.error(f"Error processing deep link: {e}")
+                    logger.error(f"Error processing deep link comment_: {e}")
+
+            elif context.args and context.args[0].startswith("addcomment_"):
+                try:
+                    conf_id_str = context.args[0].split('_')[1]
+                    conf_id = int(conf_id_str)
+                    context.user_data[update.effective_user.id] = {
+                        'state': 'awaiting_reply',
+                        'conf_id': conf_id,
+                        'reply_to_id': None
+                    }
+                    text = f"✍️ *Adding a comment to #{conf_id}:*\n\nSend your comment directly in this chat to post it."
+                    keyboard = [
+                        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_comment_flow")]
+                    ]
+                    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+                    return
+                except (IndexError, ValueError) as e:
+                    logger.error(f"Error processing deep link addcomment_: {e}")
+
+            elif context.args and context.args[0].startswith("browsecomments_"):
+                try:
+                    conf_id_str = context.args[0].split('_')[1]
+                    conf_id = int(conf_id_str)
+                    text = get_confession_options_text(conf_id)
+                    markup = get_confession_options_markup(conf_id)
+                    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+                    await browse_comments_action(update, context, conf_id)
+                    return
+                except (IndexError, ValueError) as e:
+                    logger.error(f"Error processing deep link browsecomments_: {e}")
 
             user_alias = get_user_alias(update.effective_user.id)
 
@@ -626,6 +631,7 @@ async def handle_confession(update: Update,
             posted_confession["replies"].append({
                 "reply_id": reply_id,
                 "text": text if text else "[Media/No Text]",
+                "user_id": user_id,
                 "user_alias": user_alias,
                 "approved_time": update.message.date.astimezone(utc).isoformat(),
                 "reply_to_id": reply_to_id,
@@ -633,10 +639,37 @@ async def handle_confession(update: Update,
             })
             save_store()
  
-            # Show updated comments list
-            page_text, page_markup = get_comment_page_text_and_markup(conf_id_to_reply_to, user_id)
+            # Update the channel post keyboard if we have the message ID
+            channel_msg_id = posted_confession.get("channel_message_id")
+            if channel_msg_id:
+                try:
+                    bot_info = await context.bot.get_me()
+                    bot_username = bot_info.username
+                    replies_count = len(posted_confession.get("replies", []))
+                    updated_keyboard = [
+                        [
+                            InlineKeyboardButton(
+                                "➕ Add Comment",
+                                url=f"https://t.me/{bot_username}?start=addcomment_{conf_id_to_reply_to}"
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                f"💬 Browse Comments ({replies_count})",
+                                url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id_to_reply_to}"
+                            )
+                        ]
+                    ]
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=CHANNEL_ID,
+                        message_id=channel_msg_id,
+                        reply_markup=InlineKeyboardMarkup(updated_keyboard)
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not update channel post keyboard: {e}")
+
             await update.message.reply_text("✅ Your comment has been posted!")
-            await update.message.reply_text(page_text, parse_mode="Markdown", reply_markup=page_markup)
+            await browse_comments_action(update, context, conf_id_to_reply_to)
             return
 
         # State: Awaiting Feedback
@@ -675,11 +708,7 @@ async def handle_callbacks(update: Update,
             if user_id in context.user_data:
                 del context.user_data[user_id]
             
-            text, markup = get_comment_page_text_and_markup(conf_id, user_id)
-            if query.message.caption:
-                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
-            else:
-                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
+            await browse_comments_action(update, context, conf_id)
             return
  
         if action_data[0] == "add_comment":
@@ -698,7 +727,7 @@ async def handle_callbacks(update: Update,
             )
             
             keyboard = [
-                [InlineKeyboardButton("⬅️ Back", callback_data=f"browse_comments|{conf_id}")]
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_comment_flow")]
             ]
             markup = InlineKeyboardMarkup(keyboard)
             
@@ -736,14 +765,86 @@ async def handle_callbacks(update: Update,
             )
             
             keyboard = [
-                [InlineKeyboardButton("⬅️ Back", callback_data=f"browse_comments|{conf_id}")]
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_comment_flow")]
             ]
             markup = InlineKeyboardMarkup(keyboard)
             
-            if query.message.caption:
-                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
+            await query.message.reply_text(text=text, parse_mode="Markdown", reply_markup=markup)
+            return
+
+        if action_data[0] in ["like_comment", "dislike_comment"]:
+            action = action_data[0]
+            conf_id_str = action_data[1]
+            reply_id = int(action_data[2])
+            user_id = str(query.from_user.id)
+            
+            conf_key = str(conf_id_str)
+            if conf_key not in store["posted"]:
+                await query.answer("⚠️ Confession not found.")
+                return
+                
+            replies = store["posted"][conf_key].get("replies", [])
+            target_reply = None
+            for r in replies:
+                if r.get("reply_id") == reply_id:
+                    target_reply = r
+                    break
+                    
+            if not target_reply:
+                await query.answer("⚠️ Comment not found.")
+                return
+                
+            voters = target_reply.get("voters", {})
+            vote_type = "like" if action == "like_comment" else "dislike"
+            previous_vote = voters.get(user_id)
+            
+            if previous_vote == vote_type:
+                del voters[user_id]
+                message_text = "Vote removed!"
+            elif previous_vote and previous_vote != vote_type:
+                voters[user_id] = vote_type
+                message_text = f"Vote changed to {vote_type}!"
             else:
-                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
+                voters[user_id] = vote_type
+                message_text = "Vote counted!"
+                
+            target_reply["voters"] = voters
+            save_store()
+            
+            likes = sum(1 for v in voters.values() if v == 'like')
+            dislikes = sum(1 for v in voters.values() if v == 'dislike')
+            
+            commenter_id = target_reply.get("user_id")
+            commenter_aura = get_user_aura(commenter_id) if commenter_id else 0
+            commenter_alias = target_reply.get("user_alias", "Anonymous")
+            
+            comment_text = target_reply.get("text", "")
+            p_id = target_reply.get("reply_to_id")
+            
+            if p_id:
+                p_alias = "Anonymous"
+                for r in replies:
+                    if r.get("reply_id") == p_id:
+                        p_alias = r.get("user_alias", "Anonymous")
+                        break
+                text = f"💬 (to {p_alias}): {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+            else:
+                text = f"💬 {comment_text}\n\n👤 {commenter_alias} ⚡️ {commenter_aura} Aura"
+                
+            keyboard = [
+                [
+                    InlineKeyboardButton(f"👍 {likes}", callback_data=f"like_comment|{conf_id_str}|{reply_id}"),
+                    InlineKeyboardButton(f"👎 {dislikes}", callback_data=f"dislike_comment|{conf_id_str}|{reply_id}"),
+                    InlineKeyboardButton("Reply", callback_data=f"reply_comment|{conf_id_str}|{reply_id}")
+                ]
+            ]
+            
+            try:
+                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            except Exception as e:
+                logger.error(f"Error editing comment vote: {e}")
+                
+            await query.answer(message_text)
             return
  
         if action_data[0] == "cancel_comment_flow":
@@ -755,7 +856,7 @@ async def handle_callbacks(update: Update,
             else:
                 await query.edit_message_text(text="❌ Comment session closed.")
             return
-
+ 
         if action_data[0] == "view_confession":
             conf_id = int(action_data[1])
             user_id = query.from_user.id
@@ -870,8 +971,15 @@ async def handle_callbacks(update: Update,
                 reply_keyboard = [
                     [
                         InlineKeyboardButton(
-                            "💬 Comments",
-                            url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
+                            "➕ Add Comment",
+                            url=f"https://t.me/{bot_username}?start=addcomment_{conf_id}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "💬 Browse Comments (0)",
+                            url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id}"
+                        )
                     ]
                 ]
                 post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
@@ -1023,8 +1131,15 @@ async def approve_batch_command(update: Update,
             reply_keyboard = [
                 [
                     InlineKeyboardButton(
-                        "💬 Comments",
-                        url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
+                        "➕ Add Comment",
+                        url=f"https://t.me/{bot_username}?start=addcomment_{conf_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💬 Browse Comments (0)",
+                        url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id}"
+                    )
                 ]
             ]
             post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
