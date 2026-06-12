@@ -173,80 +173,40 @@ def get_confession_options_text(conf_id: int) -> str:
 def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
         """Generates the main keyboard for the initial confession view."""
         keyboard = [[
-            InlineKeyboardButton("💬 Add Comment",
-                                 callback_data=f"add_comment|{conf_id}"),
-            InlineKeyboardButton("👁️ Browse Comments",
-                                 callback_data=f"browse_comments|{conf_id}|0"),
+            InlineKeyboardButton("💬 View / Add Comments",
+                                 callback_data=f"browse_comments|{conf_id}"),
         ]]
         return InlineKeyboardMarkup(keyboard)
 
 
-def get_comment_page_text_and_markup(conf_id: int, index: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Generates the text and keyboard markup for a specific comment page (0-based index)."""
+def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Generates a clean, Telegram-style list of comments for a confession."""
     confession_data = store["posted"].get(str(conf_id))
     if not confession_data:
         return "⚠️ Confession not found.", None
 
+    conf_alias = confession_data.get("user_alias", "Anonymous")
     replies = confession_data.get("replies", [])
-    total_comments = len(replies)
-
-    if total_comments == 0:
-        text = f"📝 *Comments for Confession #{conf_id}*\n\n_No comments yet. Be the first one to share your thoughts._"
-        keyboard = [
-            [InlineKeyboardButton("💬 Add New Comment", callback_data=f"add_comment|{conf_id}")],
-            [InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")]
-        ]
-        return text, InlineKeyboardMarkup(keyboard)
-
-    # Ensure index is within range
-    if index < 0:
-        index = 0
-    elif index >= total_comments:
-        index = total_comments - 1
-
-    reply = replies[index]
-    reply_id = reply.get("reply_id")
-    voters = reply.get("voters", {})
-    likes = sum(1 for vote in voters.values() if vote == 'like')
-    dislikes = sum(1 for vote in voters.values() if vote == 'dislike')
-    comment_author_alias = reply.get('user_alias', 'Anonymous')
-
+    
     text = (
-        f"📝 *Comments for Confession #{conf_id}* (Page {index + 1} of {total_comments})\n\n"
-        f"*Comment by {comment_author_alias}* (ID: {reply_id}):\n"
-        f"_{reply['text']}_\n\n"
-        f"👍 {likes} Likes  |  👎 {dislikes} Dislikes"
+        f"💬 *Confession #{conf_id}* (by {conf_alias}):\n"
+        f"_{confession_data['text']}_\n\n"
+        f"📢 *Comments ({len(replies)}):*\n"
     )
+    
+    if not replies:
+        text += "_No comments yet. Be the first to share your thoughts!_"
+    else:
+        for reply in replies:
+            alias = reply.get("user_alias", "Anonymous")
+            comment_text = reply.get("text", "")
+            text += f"👤 *{alias}*: {comment_text}\n"
 
-    # Navigation buttons
-    nav_row = []
-    if index > 0:
-        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"browse_comments|{conf_id}|{index - 1}"))
-    if index < total_comments - 1:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"browse_comments|{conf_id}|{index + 1}"))
+    text += "\n✍️ *Send your comment directly in this chat to post it.*"
 
-    # Actions buttons
-    vote_row = [
-        InlineKeyboardButton("👍 Like", callback_data=f"vote_comment|{conf_id}|{reply_id}|like|{index}"),
-        InlineKeyboardButton("👎 Dislike", callback_data=f"vote_comment|{conf_id}|{reply_id}|dislike|{index}")
+    keyboard = [
+        [InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")]
     ]
-
-    action_row = [
-        InlineKeyboardButton("↩️ Reply to Comment", callback_data=f"reply_comment|{conf_id}|{reply_id}|{index}"),
-        InlineKeyboardButton("💬 Add New Comment", callback_data=f"add_comment|{conf_id}")
-    ]
-
-    back_row = [
-        InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")
-    ]
-
-    keyboard = []
-    if nav_row:
-        keyboard.append(nav_row)
-    keyboard.append(vote_row)
-    keyboard.append(action_row)
-    keyboard.append(back_row)
-
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -358,7 +318,12 @@ async def start_command(update: Update,
                 try:
                     conf_id_str = context.args[0].split('_')[1]
                     conf_id = int(conf_id_str)
-                    await send_confession_options(update, context, conf_id)
+                    context.user_data[update.effective_user.id] = {
+                        'state': 'awaiting_reply',
+                        'conf_id': conf_id
+                    }
+                    text, markup = get_comment_page_text_and_markup(conf_id, update.effective_user.id)
+                    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
                     return
                 except (IndexError, ValueError) as e:
                     logger.error(f"Error processing deep link: {e}")
@@ -599,58 +564,9 @@ async def handle_confession(update: Update,
             })
             save_store()
 
-            # Show updated comments page
-            new_index = len(posted_confession["replies"]) - 1
-            page_text, page_markup = get_comment_page_text_and_markup(conf_id_to_reply_to, new_index, user_id)
+            # Show updated comments list
+            page_text, page_markup = get_comment_page_text_and_markup(conf_id_to_reply_to, user_id)
             await update.message.reply_text("✅ Your comment has been posted!")
-            await update.message.reply_text(page_text, parse_mode="Markdown", reply_markup=page_markup)
-            return
-
-        # State: Awaiting Comment Reply (to an existing Comment)
-        if user_state and user_state.get('state') == 'awaiting_comment_reply':
-            target_conf_id = user_state.get('conf_id')
-            target_reply_id = user_state.get('reply_id')
-            index = user_state.get('index', 0)
-            del context.user_data[user_id]
-
-            if target_conf_id is None or target_reply_id is None:
-                await update.message.reply_text("⚠️ Cannot submit reply: Invalid context.")
-                return
-
-            conf_key = str(target_conf_id)
-            if conf_key not in store["posted"]:
-                await update.message.reply_text("⚠️ The original confession no longer exists.")
-                return
-
-            replies = store["posted"][conf_key]["replies"]
-            target_comment_index = -1
-            for i, reply in enumerate(replies):
-                if reply.get('reply_id') == target_reply_id:
-                    target_comment_index = i
-                    break
-
-            if target_comment_index == -1:
-                await update.message.reply_text("⚠️ The comment you are replying to no longer exists.")
-                return
-
-            replying_to_alias = replies[target_comment_index].get('user_alias', 'Anonymous')
-            reply_text_full = f"*Reply to {replying_to_alias}:* {text if text else '[Media/No Text]'}"
-
-            new_reply_id = store['next_id']
-            store["next_id"] += 1
-
-            replies.append({
-                "reply_id": new_reply_id,
-                "text": reply_text_full,
-                "user_alias": user_alias,
-                "approved_time": update.message.date.astimezone(utc).isoformat(),
-                "voters": {}
-            })
-            save_store()
-
-            new_index = len(replies) - 1
-            page_text, page_markup = get_comment_page_text_and_markup(target_conf_id, new_index, user_id)
-            await update.message.reply_text("✅ Your reply has been posted!")
             await update.message.reply_text(page_text, parse_mode="Markdown", reply_markup=page_markup)
             return
 
@@ -731,145 +647,34 @@ async def handle_callbacks(update: Update,
             ]
             try:
                 await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(reply_keyboard))
-            except Exception as e:
-                logger.error(f"Failed to update channel reply markup: {e}")
-
-            await query.answer(message_text)
-            return
+            except Exception:
+                pass
 
         # --- 2. Public Comment Interactivity ---
         if action_data[0] == "browse_comments":
             conf_id = int(action_data[1])
-            index = int(action_data[2]) if len(action_data) > 2 else 0
-            text, markup = get_comment_page_text_and_markup(conf_id, index, query.from_user.id)
-            if query.message.caption:
-                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
-            else:
-                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-            return
-
-        if action_data[0] == "vote_comment":
-            conf_id = int(action_data[1])
-            reply_id = int(action_data[2])
-            vote_type = action_data[3]
-            index = int(action_data[4])
-            user_id = str(query.from_user.id)
-
-            conf_key = str(conf_id)
-            if conf_key not in store["posted"]:
-                await query.answer("Confession not found.")
-                return
-
-            replies = store["posted"][conf_key].get("replies", [])
-            target_reply = None
-            for r in replies:
-                if r.get('reply_id') == reply_id:
-                    target_reply = r
-                    break
-
-            if not target_reply:
-                await query.answer("Comment not found.")
-                return
-
-            voters = target_reply.get('voters', {})
-            previous_vote = voters.get(user_id)
-
-            if previous_vote == vote_type:
-                del voters[user_id]
-                message_text = "Vote removed!"
-            elif previous_vote and previous_vote != vote_type:
-                voters[user_id] = vote_type
-                message_text = f"Vote changed to '{vote_type}'!"
-            else:
-                voters[user_id] = vote_type
-                message_text = f"{vote_type.capitalize()} counted!"
-
-            target_reply['voters'] = voters
-            save_store()
-
-            text, markup = get_comment_page_text_and_markup(conf_id, index, query.from_user.id)
-            if query.message.caption:
-                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
-            else:
-                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-            await query.answer(message_text)
-            return
-
-        if action_data[0] == "reply_comment":
-            conf_id = int(action_data[1])
-            reply_id = int(action_data[2])
-            index = int(action_data[3])
             user_id = query.from_user.id
-            user_alias = get_user_alias(user_id)
-
+            
+            # Automatically set the commenting state
             context.user_data[user_id] = {
-                'state': 'awaiting_comment_reply',
-                'conf_id': conf_id,
-                'reply_id': reply_id,
-                'index': index
+                'state': 'awaiting_reply',
+                'conf_id': conf_id
             }
-
-            conf_key = str(conf_id)
-            replies = store["posted"][conf_key].get("replies", [])
-            target_reply = None
-            for r in replies:
-                if r.get('reply_id') == reply_id:
-                    target_reply = r
-                    break
-
-            if not target_reply:
-                await query.answer("Comment not found.")
-                return
-
-            comment_author_alias = target_reply.get('user_alias', 'Anonymous')
-            response_text = (
-                f"💬 *You are submitting a REPLY to {comment_author_alias}'s comment:*\n"
-                f"> _{target_reply['text']}_\n\n"
-                f"Your alias for this reply: *{user_alias}*\n\n"
-                f"Please send your reply message now. Or `/cancel` to abort."
-            )
+            
+            text, markup = get_comment_page_text_and_markup(conf_id, user_id)
             if query.message.caption:
-                await query.edit_message_caption(caption=response_text, parse_mode="Markdown")
+                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
             else:
-                await query.edit_message_text(response_text, parse_mode="Markdown")
+                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
             return
 
-        if action_data[0] in ["view_confession", "add_comment"]:
-            action, data_id = action_data[0], action_data[1]
-            try:
-                conf_id = int(data_id)
-            except (IndexError, ValueError):
-                await query.answer("Invalid confession ID.")
-                return
-
-            confession_data = store["posted"].get(str(conf_id))
-            if not confession_data:
-                await query.answer("⚠️ Confession not found.")
-                return
-
-            if action == "view_confession":
-                await send_confession_options(update, context, conf_id)
-                return
-
-            elif action == "add_comment":
-                user_id = update.effective_user.id
-                user_alias = get_user_alias(user_id)
-
-                context.user_data[user_id] = {
-                    'state': 'awaiting_reply',
-                    'conf_id': conf_id
-                }
-
-                response_text = (
-                    f"💬 *You are submitting a comment to Confession #{conf_id}* (as *{user_alias}*):\n\n"
-                    f"> _{confession_data['text'][:150]}..._\n\n"
-                    f"Please send your comment now."
-                )
-                if query.message.caption:
-                    await query.edit_message_caption(caption=response_text, parse_mode="Markdown")
-                else:
-                    await query.edit_message_text(response_text, parse_mode="Markdown")
-                return
+        if action_data[0] == "view_confession":
+            conf_id = int(action_data[1])
+            user_id = query.from_user.id
+            if user_id in context.user_data:
+                del context.user_data[user_id]
+            await send_confession_options(update, context, conf_id)
+            return
 
         # --- 3. Admin Actions ---
         if query.message.chat.id != ADMIN_GROUP_ID:
