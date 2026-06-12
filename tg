@@ -84,14 +84,12 @@ def check_auto_moderation(text: str) -> List[str]:
 
 # --- Adjectives & Nouns for Random Alias Generator ---
 ADJECTIVES = [
-    "Sneaky", "Happy", "Shy", "Curious", "Sleepy", "Vulnerable", "Golden", "Wandering",
-    "Dancing", "Silent", "Cheerful", "Clever", "Gentle", "Brave", "Clumsy", "Spunky",
-    "Quirky", "Calm", "Dreamy", "Mysterious", "Giggly", "Polite", "Friendly", "Dazzling"
+    "Neo", "Zen", "Void", "Apex", "Nova", "Dark", "Rogue", "Byte", "Cyber", "Mega",
+    "Meta", "Echo", "Astra", "Zero", "Glitch", "Retro", "Nano", "Flux", "Hyper", "Solar"
 ]
 NOUNS = [
-    "Panda", "Avocado", "Squirrel", "Muffin", "Koala", "Potato", "Fox", "Otter",
-    "Capybara", "Penguin", "Hedgehog", "Raccoon", "Sloth", "Badger", "Dolphin",
-    "Llama", "Giraffe", "Cheetah", "Hamster", "Rabbit", "Turtle", "Octopus", "Owl"
+    "Fox", "Wolf", "Hawk", "Storm", "Volt", "Wave", "Sage", "Grid", "Node", "Bolt",
+    "Spark", "Onyx", "Core", "Rider", "Link", "Edge", "Cipher", "Drift", "Nexus", "Vector"
 ]
 
     # ===== Persistent Storage (Local JSON) =====
@@ -150,8 +148,8 @@ def get_user_alias(user_id: int) -> str:
         if user_id_str not in store.get("user_profiles", {}):
             adj = random.choice(ADJECTIVES)
             noun = random.choice(NOUNS)
-            num = random.randint(10, 99)
-            generated_alias = f"{adj} {noun} {num}"
+            num = random.randint(1, 9)
+            generated_alias = f"{adj}{noun}{num}"
             if "user_profiles" not in store:
                 store["user_profiles"] = {}
             store["user_profiles"][user_id_str] = generated_alias
@@ -367,19 +365,32 @@ async def start_command(update: Update,
 
             user_alias = get_user_alias(update.effective_user.id)
 
+            channel_name = "our channel"
+            try:
+                chat = await context.bot.get_chat(CHANNEL_ID)
+                if chat and chat.title:
+                    channel_name = chat.title
+                elif chat and chat.username:
+                    channel_name = f"@{chat.username}"
+            except Exception as e:
+                logger.warning(f"Could not retrieve channel title: {e}")
+                if isinstance(CHANNEL_ID, str) and CHANNEL_ID.startswith("@"):
+                    channel_name = CHANNEL_ID
+
             welcome_message = (
-                f"👋 *Welcome to the weirdo confession bot!* 🤫\n\n"
-                f"Your current nickname(Alias) is: *{user_alias}*\n"
-                "This bot allows you to share your thoughts, secrets, and stories completely anonymously in our channel (`{CHANNEL_ID}`).\n\n"
-                "*Here are the Rules & Guidelines:*\n"
-                "1. *Alias:* Use the `/setalias <name>` command to choose a stable nickname for your posts and comments.\n"
-                "2. *Anonymity:* Your Telegram user ID is never revealed. Only your chosen alias is displayed.\n"
-                "3. *Submission:* Use the `/confess` command, or simply send your message in this chat. It will be sent for review.\n"
-                "4. *Review:* All confessions are reviewed by administrators before being posted to the channel.\n"
-                "5. *NO Hate Speech:* Submissions must not contain hate speech, bullying, harassment, or discrimination.\n"
-                "6. *Respect Rights:* Do not submit content that violates the rights of any individual, including privacy or intellectual property.\n"
-                "7. *Interaction:* Use the buttons below posts in the channel to leave anonymous comments and react to other confessions.\n\n"
-                "Ready to share? Tap `/confess` or just start typing!")
+                f"👋 *Welcome to the confession box!* 🤫\n\n"
+                f"Your current nickname is: *{user_alias}* 🎭\n\n"
+                f"Use this bot to share your wildest thoughts, secrets, and stories completely anonymously in *{channel_name}*! 🌟\n\n"
+                f"✨ *How it works & Ground Rules:* ✨\n"
+                f"🕵️‍♂️ *Alias:* Set your own custom handle with `/setalias <name>` whenever you want. Otherwise, we'll keep you anonymous with your assigned cool handle.\n"
+                f"🔒 *100% Anonymous:* We never reveal your real Telegram identity. Only your alias will be displayed.\n"
+                f"✍️ *Share:* Ready to confess? Just type your secret directly in this chat, or use `/confess`.\n"
+                f"👀 *Review:* Our admins will review submissions before they go live on the channel.\n"
+                f"🚫 *Keep it chill:* No hate speech, bullying, doxxing, or harassment. Let's keep this space safe and fun for everyone!\n"
+                f"🙌 *Respect others:* Don't post private info or violate anyone else's rights.\n"
+                f"💬 *Chit-chat:* Use the buttons under the channel posts to comment on other confessions and react!\n\n"
+                f"Ready to share? Tap `/confess` or just start typing! 🚀"
+            )
 
             await update.message.reply_text(welcome_message, parse_mode="Markdown")
 
