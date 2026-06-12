@@ -172,10 +172,14 @@ def get_confession_options_text(conf_id: int) -> str:
 
 def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
         """Generates the main keyboard for the initial confession view."""
-        keyboard = [[
-            InlineKeyboardButton("💬 View / Add Comments",
-                                 callback_data=f"browse_comments|{conf_id}"),
-        ]]
+        confession_data = store["posted"].get(str(conf_id))
+        replies_count = len(confession_data.get("replies", [])) if confession_data else 0
+        keyboard = [
+            [
+                InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}"),
+                InlineKeyboardButton(f"💬 View Comments ({replies_count})", callback_data=f"browse_comments|{conf_id}")
+            ]
+        ]
         return InlineKeyboardMarkup(keyboard)
 
 
@@ -187,7 +191,8 @@ def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, I
 
     replies = confession_data.get("replies", [])
     
-    text = f"💬 *Comments ({len(replies)}):*\n\n"
+    confession_text = get_confession_options_text(conf_id)
+    text = f"{confession_text}\n💬 *Comments ({len(replies)}):*\n\n"
     if not replies:
         text += "_No comments yet._\n"
     else:
@@ -197,7 +202,10 @@ def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, I
             text += f"• *{alias}*: {comment_text}\n"
 
     keyboard = [
-        [InlineKeyboardButton("❌ Close", callback_data="cancel_comment_flow")]
+        [
+            InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}"),
+            InlineKeyboardButton("⬅️ Back", callback_data=f"view_confession|{conf_id}")
+        ]
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -310,12 +318,7 @@ async def start_command(update: Update,
                 try:
                     conf_id_str = context.args[0].split('_')[1]
                     conf_id = int(conf_id_str)
-                    context.user_data[update.effective_user.id] = {
-                        'state': 'awaiting_reply',
-                        'conf_id': conf_id
-                    }
-                    text, markup = get_comment_page_text_and_markup(conf_id, update.effective_user.id)
-                    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+                    await send_confession_options(update, context, conf_id)
                     return
                 except (IndexError, ValueError) as e:
                     logger.error(f"Error processing deep link: {e}")
@@ -595,13 +598,33 @@ async def handle_callbacks(update: Update,
             conf_id = int(action_data[1])
             user_id = query.from_user.id
             
-            # Automatically set the commenting state
+            if user_id in context.user_data:
+                del context.user_data[user_id]
+            
+            text, markup = get_comment_page_text_and_markup(conf_id, user_id)
+            if query.message.caption:
+                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
+            return
+
+        if action_data[0] == "add_comment":
+            conf_id = int(action_data[1])
+            user_id = query.from_user.id
+            
             context.user_data[user_id] = {
                 'state': 'awaiting_reply',
                 'conf_id': conf_id
             }
             
-            text, markup = get_comment_page_text_and_markup(conf_id, user_id)
+            confession_text = get_confession_options_text(conf_id)
+            text = f"{confession_text}\n✍️ *Send your comment directly in this chat to post it.*"
+            
+            keyboard = [
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"view_confession|{conf_id}")]
+            ]
+            markup = InlineKeyboardMarkup(keyboard)
+            
             if query.message.caption:
                 await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
             else:
