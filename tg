@@ -52,11 +52,12 @@ logging.basicConfig(
         level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-    # ===== HARDCODED CONFIGURATION & ENVIRONMENT VARIABLES (MUST CHANGE!) =====
-    # 🛑 IMPORTANT: Replace these placeholder values with your actual data.
-BOT_TOKEN = "8394081800:AAHqaAOPyOu1O7xQAJj84JSeh1mCBF0EZlQ"  # Your bot token
-CHANNEL_ID = "@thretitest"  # Your public channel username (e.g., @MyConfessionsChannel)
-ADMIN_GROUP_ID = -1003301880047  # Your admin group/supergroup ID (starts with -100)
+    # ===== CONFIGURATION (reads from environment variables for production) =====
+    # 🛑 On Render, set these as Environment Variables in the dashboard.
+    # Locally, they fall back to the defaults below.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8394081800:AAHqaAOPyOu1O7xQAJj84JSeh1mCBF0EZlQ")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@thretitest")
+ADMIN_GROUP_ID = int(os.environ.get("ADMIN_GROUP_ID", "-1003301880047"))
 
 DATA_FILE = "confessions_store.json"
 ADMIN_ALIAS = "Admin"
