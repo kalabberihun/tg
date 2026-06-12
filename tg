@@ -457,7 +457,9 @@ async def help_command(update: Update,
                 "4. `/stats`: Show comment and vote statistics for all posted confessions.\n"
                 "5. `/deleteconfession <id>`: Permanently delete a posted confession and all its comments.\n"
                 "6. `/deletecomment <id> <index>`: Delete a specific comment by confession `<id>` and comment `<index>` (1-based).\n"
-                "7. `/reset_counter`: **DANGER** Clears ALL data and resets the counter to 1."
+                "7. `/backup`: Download a copy of the current database.\n"
+                "8. `/restore`: Reply to a backup `.json` file with `/restore` to restore data.\n"
+                "9. `/reset_counter`: **DANGER** Clears ALL data and resets the counter to 1."
             )
 
         await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -871,6 +873,54 @@ async def handle_callbacks(update: Update,
 
         # --- 3. Admin Actions ---
         if query.message.chat.id != ADMIN_GROUP_ID:
+            return
+
+        # Database confirmation / restore actions
+        if action_data[0] == "confirm_reset_db":
+            store["next_id"] = 1
+            store["pending"] = {}
+            store["posted"] = {}
+            store["user_profiles"] = {}
+            save_store()
+            await query.edit_message_text("⚠️ **Database has been completely reset.** Counter set to 1.")
+            return
+
+        if action_data[0] == "cancel_reset_db":
+            await query.edit_message_text("❌ Database reset cancelled. Database is safe.")
+            return
+
+        if action_data[0] == "confirm_restore":
+            file_id = action_data[1]
+            try:
+                new_file = await context.bot.get_file(file_id)
+                temp_path = "temp_restore.json"
+                await new_file.download_to_drive(temp_path)
+                
+                with open(temp_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                required_keys = ["next_id", "pending", "posted", "user_profiles"]
+                if not all(k in data for k in required_keys):
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    await query.edit_message_text("❌ *Restore failed:* The file does not have the expected database structure.", parse_mode="Markdown")
+                    return
+                
+                store.clear()
+                store.update(data)
+                save_store()
+                
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                await query.edit_message_text("✅ *Database successfully restored from backup!*", parse_mode="Markdown")
+                logger.info("Database successfully restored from admin backup.")
+            except Exception as e:
+                logger.error(f"Restore failed: {e}")
+                await query.edit_message_text(f"❌ *Restore failed:* An error occurred.\n`{e}`", parse_mode="Markdown")
+            return
+
+        if action_data[0] == "cancel_restore":
+            await query.edit_message_text("❌ Restore operation cancelled.")
             return
 
         if action_data[0] in ["approve", "reject"]:
@@ -1292,13 +1342,73 @@ async def delete_comment_command(update: Update, context: ContextTypes.DEFAULT_T
 
 @is_admin_chat
 async def reset_counter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-      """Danger: clears the entire database and resets the ID counter."""
-      store["next_id"] = 1
-      store["pending"] = {}
-      store["posted"] = {}
-      store["user_profiles"] = {}
-      save_store()
-      await update.message.reply_text("⚠️ **Database has been completely reset.** Counter set to 1.")
+      """Danger: clears the entire database and resets the ID counter with confirmation."""
+      keyboard = [
+          [
+              InlineKeyboardButton("🔥 Yes, Wipe Database", callback_data="confirm_reset_db"),
+              InlineKeyboardButton("❌ Cancel", callback_data="cancel_reset_db")
+          ]
+      ]
+      await update.message.reply_text(
+          "⚠️ **CRITICAL WARNING:** This will completely delete all confessions, comments, reactions, and user profiles. The database will be wiped out and the ID counter reset to 1.\n\n"
+          "This action is permanent and **cannot be undone**.\n\n"
+          "Are you absolutely sure?",
+          parse_mode="Markdown",
+          reply_markup=InlineKeyboardMarkup(keyboard)
+      )
+
+
+@is_admin_chat
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to download the current confessions_store.json database."""
+    if not os.path.exists(DATA_FILE):
+        await update.message.reply_text("❌ Database file not found.")
+        return
+    
+    try:
+        with open(DATA_FILE, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename="confessions_store_backup.json",
+                caption="📁 *Confession Bot Database Backup*\nKeep this file safe! You can restore it using `/restore`.",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send backup: {e}")
+        await update.message.reply_text(f"❌ Failed to send backup: {e}")
+
+
+@is_admin_chat
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to restore the database from a JSON file.
+    Usage: Reply to a valid backup JSON file with /restore
+    """
+    message = update.message
+    if not message.reply_to_message or not message.reply_to_message.document:
+        await message.reply_text(
+            "❌ *How to restore:* Reply to a valid backup `.json` file with `/restore`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    doc = message.reply_to_message.document
+    if not doc.file_name.endswith('.json'):
+        await message.reply_text("❌ Please reply to a valid `.json` backup file.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm Restore", callback_data=f"confirm_restore|{doc.file_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_restore")
+        ]
+    ]
+    await message.reply_text(
+        "⚠️ *WARNING:* Restoring will overwrite the current database. All unsaved confessions and comments will be lost.\n\n"
+        "Are you sure you want to proceed?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
     # ===== Main Application Setup =====
@@ -1330,6 +1440,8 @@ def main() -> None:
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("deleteconfession", delete_confession_command))
         application.add_handler(CommandHandler("deletecomment", delete_comment_command))
+        application.add_handler(CommandHandler("backup", backup_command))
+        application.add_handler(CommandHandler("restore", restore_command))
         application.add_handler(CommandHandler("reset_counter", reset_counter_command))
 
         # --- Generic Handlers (Must come after Command Handlers) ---
