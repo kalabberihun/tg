@@ -165,7 +165,7 @@ def get_confession_options_text(conf_id: int) -> str:
 
         conf_alias = confession_data.get("user_alias", "Anonymous")
 
-        text = f"*Confession #{conf_id}* (by {conf_alias})\n\n{confession_data['text']}\n"
+        text = f"*#{conf_id}* \u2014 {conf_alias}\n\n{confession_data['text']}\n"
 
         return text
 
@@ -590,62 +590,7 @@ async def handle_callbacks(update: Update,
 
         action_data = query.data.split("|")
 
-        # --- 1. Channel Reactions ---
-        if action_data[0] in ["like_conf", "dislike_conf"]:
-            action = action_data[0]
-            conf_id_str = action_data[1]
-            user_id = str(update.effective_user.id)
-
-            conf_key = str(conf_id_str)
-            if conf_key not in store["posted"]:
-                await query.answer("⚠️ Confession not found.")
-                return
-
-            posted_conf = store["posted"][conf_key]
-            if "voters" not in posted_conf:
-                posted_conf["voters"] = {}
-            voters = posted_conf["voters"]
-
-            vote_type = "like" if action == "like_conf" else "dislike"
-            previous_vote = voters.get(user_id)
-
-            if previous_vote == vote_type:
-                del voters[user_id]
-                message_text = "Vote removed!"
-            elif previous_vote and previous_vote != vote_type:
-                voters[user_id] = vote_type
-                message_text = f"Vote changed to {vote_type}!"
-            else:
-                voters[user_id] = vote_type
-                message_text = "Vote counted!"
-
-            posted_conf["voters"] = voters
-            save_store()
-
-            likes = sum(1 for v in voters.values() if v == 'like')
-            dislikes = sum(1 for v in voters.values() if v == 'dislike')
-
-            bot_info = await context.bot.get_me()
-            bot_username = bot_info.username
-
-            reply_keyboard = [
-                [
-                    InlineKeyboardButton(f"👍 Like ({likes})", callback_data=f"like_conf|{conf_id_str}"),
-                    InlineKeyboardButton(f"👎 Dislike ({dislikes})", callback_data=f"dislike_conf|{conf_id_str}")
-                ],
-                [
-                    InlineKeyboardButton("💬 Add / View Comments", url=f"https://t.me/{bot_username}?start=comment_{conf_id_str}")
-                ]
-            ]
-            try:
-                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(reply_keyboard))
-            except Exception:
-                pass
-
-            await query.answer(message_text)
-            return
-
-        # --- 2. Public Comment Interactivity ---
+        # --- 1. Public Comment Interactivity ---
         if action_data[0] == "browse_comments":
             conf_id = int(action_data[1])
             user_id = query.from_user.id
@@ -681,7 +626,7 @@ async def handle_callbacks(update: Update,
             await send_confession_options(update, context, conf_id)
             return
 
-        # --- 3. Admin Actions ---
+        # --- 2. Admin Actions ---
         if query.message.chat.id != ADMIN_GROUP_ID:
             return
 
@@ -786,16 +731,12 @@ async def handle_callbacks(update: Update,
 
                 reply_keyboard = [
                     [
-                        InlineKeyboardButton("👍 Like (0)", callback_data=f"like_conf|{conf_id}"),
-                        InlineKeyboardButton("👎 Dislike (0)", callback_data=f"dislike_conf|{conf_id}")
-                    ],
-                    [
                         InlineKeyboardButton(
-                            "💬 Add / View Comments",
+                            "💬 Comments",
                             url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
                     ]
                 ]
-                post_text = f"*#{conf_id} Confession* - Posted by: {conf_alias}\n\n{conf['text']}"
+                post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
                 
                 media_file_id = conf.get("media_file_id")
                 media_type = conf.get("media_type")
@@ -943,16 +884,12 @@ async def approve_batch_command(update: Update,
 
             reply_keyboard = [
                 [
-                    InlineKeyboardButton("👍 Like (0)", callback_data=f"like_conf|{conf_id}"),
-                    InlineKeyboardButton("👎 Dislike (0)", callback_data=f"dislike_conf|{conf_id}")
-                ],
-                [
                     InlineKeyboardButton(
-                        "💬 Add / View Comments",
+                        "💬 Comments",
                         url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
                 ]
             ]
-            post_text = f"*#{conf_id} Confession* - Posted by: {conf_alias}\n\n{conf['text']}"
+            post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
 
             media_file_id = conf.get("media_file_id")
             media_type = conf.get("media_type")
