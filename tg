@@ -184,29 +184,101 @@ def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
 
 
 def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Generates a clean list of comments for a confession."""
+    """Generates a clean, hierarchical list of comments for a confession."""
     confession_data = store["posted"].get(str(conf_id))
     if not confession_data:
         return "⚠️ Confession not found.", None
 
     replies = confession_data.get("replies", [])
     
-    confession_text = get_confession_options_text(conf_id)
-    text = f"{confession_text}\n💬 *Comments ({len(replies)}):*\n\n"
-    if not replies:
+    # Build parent-child relationships and find root parents
+    parent_map = {r["reply_id"]: r.get("reply_to_id") for r in replies if r.get("reply_to_id")}
+    
+    def get_root(r_id):
+        current = r_id
+        while current in parent_map and parent_map[current] is not None:
+            current = parent_map[current]
+        return current
+        
+    top_level = []
+    descendants = {} # root_id -> list of reply dicts
+    
+    for r in replies:
+        r_id = r["reply_id"]
+        p_id = r.get("reply_to_id")
+        if p_id is None:
+            top_level.append(r)
+        else:
+            root_id = get_root(r_id)
+            if root_id not in descendants:
+                descendants[root_id] = []
+            descendants[root_id].append(r)
+            
+    # Assign sequential numbers while traversing DFS
+    display_comments = []
+    alias_map = {r["reply_id"]: r.get("user_alias", "Anonymous") for r in replies}
+    current_num = 1
+    
+    for r in top_level:
+        display_comments.append((current_num, 0, r))
+        r_id = r["reply_id"]
+        current_num += 1
+        
+        if r_id in descendants:
+            children_of_parent = {}
+            for child in descendants[r_id]:
+                cp_id = child.get("reply_to_id")
+                if cp_id not in children_of_parent:
+                    children_of_parent[cp_id] = []
+                children_of_parent[cp_id].append(child)
+                
+            def add_children(parent_id, depth):
+                nonlocal current_num
+                if parent_id in children_of_parent:
+                    for child in children_of_parent[parent_id]:
+                        display_comments.append((current_num, depth, child))
+                        current_num += 1
+                        add_children(child["reply_id"], depth + 1)
+                        
+            add_children(r_id, 1)
+
+    text = f"💬 *Comments on #{conf_id}:*\n\n"
+    if not display_comments:
         text += "_No comments yet._\n"
     else:
-        for reply in replies:
-            alias = reply.get("user_alias", "Anonymous")
-            comment_text = reply.get("text", "")
-            text += f"• *{alias}*: {comment_text}\n"
+        for num, depth, r in display_comments:
+            alias = r.get("user_alias", "Anonymous")
+            comment_text = r.get("text", "")
+            p_id = r.get("reply_to_id")
+            
+            indent = "   " * depth
+            prefix = "↳ " if depth > 0 else ""
+            
+            if p_id:
+                p_alias = alias_map.get(p_id, "Anonymous")
+                text += f"{indent}{prefix}{num}. *{alias}* (to *{p_alias}*): {comment_text}\n"
+            else:
+                text += f"{num}. *{alias}*: {comment_text}\n"
 
-    keyboard = [
-        [
-            InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}"),
-            InlineKeyboardButton("⬅️ Back", callback_data=f"view_confession|{conf_id}")
-        ]
-    ]
+    keyboard = []
+    keyboard.append([InlineKeyboardButton("✍️ Add Comment", callback_data=f"add_comment|{conf_id}")])
+    
+    # Add a reply button for each comment in the thread
+    reply_buttons = []
+    for num, depth, r in display_comments:
+        r_id = r["reply_id"]
+        reply_buttons.append(
+            InlineKeyboardButton(f"💬 Reply to {num}", callback_data=f"reply_comment|{conf_id}|{r_id}")
+        )
+    
+    # Chunk reply buttons into rows of 3
+    for i in range(0, len(reply_buttons), 3):
+        keyboard.append(reply_buttons[i:i+3])
+        
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back to Confession", callback_data=f"view_confession|{conf_id}"),
+        InlineKeyboardButton("❌ Close", callback_data="cancel_comment_flow")
+    ])
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -532,33 +604,35 @@ async def handle_confession(update: Update,
         # State: Awaiting Reply (to an original Confession)
         if user_state and user_state.get('state') == 'awaiting_reply':
             conf_id_to_reply_to = user_state.get('conf_id')
+            reply_to_id = user_state.get('reply_to_id')
             del context.user_data[user_id]
-
+ 
             if conf_id_to_reply_to is None:
                 await update.message.reply_text("⚠️ Cannot submit comment: Invalid context.")
                 return
-
+ 
             conf_key = str(conf_id_to_reply_to)
             if conf_key not in store["posted"]:
                 await update.message.reply_text("⚠️ Cannot submit comment: The confession no longer exists.")
                 return
-
+ 
             reply_id = store['next_id']
             store["next_id"] += 1
-
+ 
             posted_confession = store["posted"][conf_key]
             if "replies" not in posted_confession:
                 posted_confession["replies"] = []
-
+ 
             posted_confession["replies"].append({
                 "reply_id": reply_id,
                 "text": text if text else "[Media/No Text]",
                 "user_alias": user_alias,
                 "approved_time": update.message.date.astimezone(utc).isoformat(),
+                "reply_to_id": reply_to_id,
                 "voters": {}
             })
             save_store()
-
+ 
             # Show updated comments list
             page_text, page_markup = get_comment_page_text_and_markup(conf_id_to_reply_to, user_id)
             await update.message.reply_text("✅ Your comment has been posted!")
@@ -607,21 +681,24 @@ async def handle_callbacks(update: Update,
             else:
                 await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
             return
-
+ 
         if action_data[0] == "add_comment":
             conf_id = int(action_data[1])
             user_id = query.from_user.id
             
             context.user_data[user_id] = {
                 'state': 'awaiting_reply',
-                'conf_id': conf_id
+                'conf_id': conf_id,
+                'reply_to_id': None
             }
             
-            confession_text = get_confession_options_text(conf_id)
-            text = f"{confession_text}\n✍️ *Send your comment directly in this chat to post it.*"
+            text = (
+                f"✍️ *Adding a comment to #{conf_id}:*\n\n"
+                f"Send your comment directly in this chat to post it."
+            )
             
             keyboard = [
-                [InlineKeyboardButton("⬅️ Back", callback_data=f"view_confession|{conf_id}")]
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"browse_comments|{conf_id}")]
             ]
             markup = InlineKeyboardMarkup(keyboard)
             
@@ -631,6 +708,44 @@ async def handle_callbacks(update: Update,
                 await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
             return
 
+        if action_data[0] == "reply_comment":
+            conf_id = int(action_data[1])
+            reply_to_id = int(action_data[2])
+            user_id = query.from_user.id
+            
+            context.user_data[user_id] = {
+                'state': 'awaiting_reply',
+                'conf_id': conf_id,
+                'reply_to_id': reply_to_id
+            }
+            
+            conf_key = str(conf_id)
+            parent_alias = "Anonymous"
+            parent_text = ""
+            if conf_key in store["posted"]:
+                for r in store["posted"][conf_key].get("replies", []):
+                    if r.get("reply_id") == reply_to_id:
+                        parent_alias = r.get("user_alias", "Anonymous")
+                        parent_text = r.get("text", "")
+                        break
+            
+            text = (
+                f"✍️ *Replying to {parent_alias}'s comment:*\n"
+                f"> _{parent_text}_\n\n"
+                f"Send your reply directly in this chat to post it."
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"browse_comments|{conf_id}")]
+            ]
+            markup = InlineKeyboardMarkup(keyboard)
+            
+            if query.message.caption:
+                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
+            return
+ 
         if action_data[0] == "cancel_comment_flow":
             user_id = query.from_user.id
             if user_id in context.user_data:
@@ -1086,26 +1201,93 @@ async def delete_confession_command(update: Update, context: ContextTypes.DEFAUL
 
 @is_admin_chat
 async def delete_comment_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-      """Admin command to delete a specific comment (1-based index)."""
+      """Admin command to delete a specific comment (1-based index matching sequential comments)."""
       if len(context.args) < 2:
           await update.message.reply_text("Usage: `/deletecomment <confession_id> <comment_index>`")
           return
       try:
           conf_id = context.args[0]
-          comment_index = int(context.args[1]) - 1 # Convert to 0-based index
+          comment_index = int(context.args[1]) - 1
           
           if conf_id not in store["posted"]:
               await update.message.reply_text("❌ Confession not found.")
               return
           
-          replies = store["posted"][conf_id].get("replies", [])
-          if comment_index < 0 or comment_index >= len(replies):
-              await update.message.reply_text(f"❌ Invalid comment index. Comment count: {len(replies)}")
-              return
+          confession_data = store["posted"][conf_id]
+          replies = confession_data.get("replies", [])
           
-          removed = replies.pop(comment_index)
+          parent_map = {r["reply_id"]: r.get("reply_to_id") for r in replies if r.get("reply_to_id")}
+          
+          def get_root(r_id):
+              current = r_id
+              while current in parent_map and parent_map[current] is not None:
+                  current = parent_map[current]
+              return current
+              
+          top_level = []
+          descendants = {}
+          for r in replies:
+              r_id = r["reply_id"]
+              p_id = r.get("reply_to_id")
+              if p_id is None:
+                  top_level.append(r)
+              else:
+                  root_id = get_root(r_id)
+                  if root_id not in descendants:
+                      descendants[root_id] = []
+                  descendants[root_id].append(r)
+                  
+          display_comments = []
+          for r in top_level:
+              display_comments.append(r)
+              r_id = r["reply_id"]
+              
+              if r_id in descendants:
+                  children_of_parent = {}
+                  for child in descendants[r_id]:
+                      cp_id = child.get("reply_to_id")
+                      if cp_id not in children_of_parent:
+                          children_of_parent[cp_id] = []
+                      children_of_parent[cp_id].append(child)
+                      
+                  def add_children(parent_id):
+                      if parent_id in children_of_parent:
+                          for child in children_of_parent[parent_id]:
+                              display_comments.append(child)
+                              add_children(child["reply_id"])
+                  add_children(r_id)
+                  
+          if comment_index < 0 or comment_index >= len(display_comments):
+              await update.message.reply_text(f"❌ Invalid comment index. Comment count: {len(display_comments)}")
+              return
+              
+          target_comment = display_comments[comment_index]
+          target_id = target_comment.get("reply_id")
+          
+          to_delete = {target_id}
+          child_map = {}
+          for r in replies:
+              p_id = r.get("reply_to_id")
+              if p_id:
+                  p_id = int(p_id)
+                  if p_id not in child_map:
+                      child_map[p_id] = []
+                  child_map[p_id].append(r["reply_id"])
+                  
+          def collect_descendants(parent_id):
+              if parent_id in child_map:
+                  for c_id in child_map[parent_id]:
+                      to_delete.add(c_id)
+                      collect_descendants(c_id)
+                      
+          if target_id:
+              collect_descendants(target_id)
+              
+          new_replies = [r for r in replies if r.get("reply_id") not in to_delete]
+          confession_data["replies"] = new_replies
           save_store()
-          await update.message.reply_text(f"✅ Comment index {comment_index + 1} (ID: {removed.get('reply_id')}) removed.")
+          
+          await update.message.reply_text(f"✅ Comment index {comment_index + 1} and its replies have been removed.")
       except Exception as e:
           await update.message.reply_text(f"❌ Error: {e}")
 
