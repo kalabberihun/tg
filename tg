@@ -1,0 +1,1353 @@
+import json
+import os
+import logging
+import random
+import time
+from functools import wraps
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat, BotCommand
+from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        ContextTypes,
+        filters,
+    )
+from pytz import utc
+from datetime import datetime
+from typing import List, Dict, Any, Union
+
+    # Replit specific imports (kept for Replit deployment structure)
+from flask import Flask
+from threading import Thread
+
+    # --- Flask Keep-Alive Integration (Required for 24/7 uptime on Replit) ---
+app = Flask(__name__)
+
+
+@app.route('/')
+def home():
+        # This endpoint is constantly pinged by UptimeRobot
+        return "Confession Bot is running and awake!"
+
+
+def run_flask():
+        # Run the Flask web server
+        port = int(os.environ.get('PORT', 8080))
+        # Setting use_reloader=False is crucial when running Flask in a separate thread
+        app.run(host='0.0.0.0', port=port, use_reloader=False)
+
+
+def keep_alive():
+        # Start the web server in a separate thread
+        t = Thread(target=run_flask)
+        t.start()
+
+
+    # ------------------------------------------------------------------------
+
+    # --- Logging Setup ---
+logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+    # ===== HARDCODED CONFIGURATION & ENVIRONMENT VARIABLES (MUST CHANGE!) =====
+    # 🛑 IMPORTANT: Replace these placeholder values with your actual data.
+BOT_TOKEN = "8394081800:AAHqaAOPyOu1O7xQAJj84JSeh1mCBF0EZlQ"  # Your bot token
+CHANNEL_ID = "@thretitest"  # Your public channel username (e.g., @MyConfessionsChannel)
+ADMIN_GROUP_ID = -1003301880047  # Your admin group/supergroup ID (starts with -100)
+
+DATA_FILE = "confessions_store.json"
+ADMIN_ALIAS = "Admin"
+MAX_BATCH_APPROVAL = 15
+    # =================================================
+
+    # ===== Rate Limiting & Auto-Moderation =====
+last_submission_time: Dict[int, float] = {}
+RATE_LIMIT_SECONDS = 60
+
+TOXIC_KEYWORDS = [
+    "slurs", "kill yourself", "kys", "hate speech", "doxx", "retard", "faggot",
+    "nigger", "porn", "xxx", "hack", "scam"
+]
+
+def check_auto_moderation(text: str) -> List[str]:
+    """Checks if confession contains toxic keywords and returns flagged words."""
+    found = []
+    text_lower = text.lower()
+    for word in TOXIC_KEYWORDS:
+        if word in text_lower:
+            found.append(word)
+    return found
+
+# --- Adjectives & Nouns for Random Alias Generator ---
+ADJECTIVES = [
+    "Sneaky", "Happy", "Shy", "Curious", "Sleepy", "Vulnerable", "Golden", "Wandering",
+    "Dancing", "Silent", "Cheerful", "Clever", "Gentle", "Brave", "Clumsy", "Spunky",
+    "Quirky", "Calm", "Dreamy", "Mysterious", "Giggly", "Polite", "Friendly", "Dazzling"
+]
+NOUNS = [
+    "Panda", "Avocado", "Squirrel", "Muffin", "Koala", "Potato", "Fox", "Otter",
+    "Capybara", "Penguin", "Hedgehog", "Raccoon", "Sloth", "Badger", "Dolphin",
+    "Llama", "Giraffe", "Cheetah", "Hamster", "Rabbit", "Turtle", "Octopus", "Owl"
+]
+
+    # ===== Persistent Storage (Local JSON) =====
+store: dict = {"next_id": 1, "pending": {}, "posted": {}, "user_profiles": {}}
+
+
+def load_store():
+        """Loads state from JSON file on startup."""
+        global store
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    loaded_data = json.load(f)
+                    store.update(loaded_data)
+                    logger.info("Successfully loaded data store.")
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"Could not decode {DATA_FILE}. Starting with fresh store.")
+        else:
+            logger.info("Data file not found. Initializing new store.")
+
+def save_store():
+        """Saves the current state of the bot's store to the JSON file."""
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save data store: {e}")
+
+
+    # ===== Access Control Decorator =====
+def is_admin_chat(func):
+        """Decorator to restrict command access to the specified ADMIN_GROUP_ID."""
+
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            chat_id: int = update.effective_chat.id
+
+            if chat_id != ADMIN_GROUP_ID:
+                logger.info(
+                    f"Access denied for chat ID {chat_id} to command {func.__name__}"
+                )
+                if update.message:
+                    await update.message.reply_text(
+                        "🚫 This command can only be used by administrators.")
+                return
+            return await func(update, context)
+
+        return wrapper
+
+
+    # ===== Public Interaction Helpers =====
+def get_user_alias(user_id: int) -> str:
+        """Retrieves the stored nickname or generates a fun, persistent random one."""
+        user_id_str = str(user_id)
+        if user_id_str not in store.get("user_profiles", {}):
+            adj = random.choice(ADJECTIVES)
+            noun = random.choice(NOUNS)
+            num = random.randint(10, 99)
+            generated_alias = f"{adj} {noun} {num}"
+            if "user_profiles" not in store:
+                store["user_profiles"] = {}
+            store["user_profiles"][user_id_str] = generated_alias
+            save_store()
+        return store["user_profiles"].get(user_id_str, "Anonymous")
+
+
+def get_confession_options_text(conf_id: int) -> str:
+        """Generates the full text for the main confession view."""
+        confession_data = store["posted"].get(str(conf_id))
+        if not confession_data:
+            return "⚠️ Confession not found."
+
+        conf_alias = confession_data.get("user_alias", "Anonymous")
+
+        text = f"*Confession #{conf_id}* (by {conf_alias})\n\n{confession_data['text']}\n"
+
+        return text
+
+
+def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
+        """Generates the main keyboard for the initial confession view."""
+        keyboard = [[
+            InlineKeyboardButton("💬 Add Comment",
+                                 callback_data=f"add_comment|{conf_id}"),
+            InlineKeyboardButton("👁️ Browse Comments",
+                                 callback_data=f"browse_comments|{conf_id}|0"),
+        ]]
+        return InlineKeyboardMarkup(keyboard)
+
+
+def get_comment_page_text_and_markup(conf_id: int, index: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Generates the text and keyboard markup for a specific comment page (0-based index)."""
+    confession_data = store["posted"].get(str(conf_id))
+    if not confession_data:
+        return "⚠️ Confession not found.", None
+
+    replies = confession_data.get("replies", [])
+    total_comments = len(replies)
+
+    if total_comments == 0:
+        text = f"📝 *Comments for Confession #{conf_id}*\n\n_No comments yet. Be the first one to share your thoughts._"
+        keyboard = [
+            [InlineKeyboardButton("💬 Add New Comment", callback_data=f"add_comment|{conf_id}")],
+            [InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")]
+        ]
+        return text, InlineKeyboardMarkup(keyboard)
+
+    # Ensure index is within range
+    if index < 0:
+        index = 0
+    elif index >= total_comments:
+        index = total_comments - 1
+
+    reply = replies[index]
+    reply_id = reply.get("reply_id")
+    voters = reply.get("voters", {})
+    likes = sum(1 for vote in voters.values() if vote == 'like')
+    dislikes = sum(1 for vote in voters.values() if vote == 'dislike')
+    comment_author_alias = reply.get('user_alias', 'Anonymous')
+
+    text = (
+        f"📝 *Comments for Confession #{conf_id}* (Page {index + 1} of {total_comments})\n\n"
+        f"*Comment by {comment_author_alias}* (ID: {reply_id}):\n"
+        f"_{reply['text']}_\n\n"
+        f"👍 {likes} Likes  |  👎 {dislikes} Dislikes"
+    )
+
+    # Navigation buttons
+    nav_row = []
+    if index > 0:
+        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"browse_comments|{conf_id}|{index - 1}"))
+    if index < total_comments - 1:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"browse_comments|{conf_id}|{index + 1}"))
+
+    # Actions buttons
+    vote_row = [
+        InlineKeyboardButton("👍 Like", callback_data=f"vote_comment|{conf_id}|{reply_id}|like|{index}"),
+        InlineKeyboardButton("👎 Dislike", callback_data=f"vote_comment|{conf_id}|{reply_id}|dislike|{index}")
+    ]
+
+    action_row = [
+        InlineKeyboardButton("↩️ Reply to Comment", callback_data=f"reply_comment|{conf_id}|{reply_id}|{index}"),
+        InlineKeyboardButton("💬 Add New Comment", callback_data=f"add_comment|{conf_id}")
+    ]
+
+    back_row = [
+        InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")
+    ]
+
+    keyboard = []
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append(vote_row)
+    keyboard.append(action_row)
+    keyboard.append(back_row)
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def send_confession_options(update: Update,
+                                      context: ContextTypes.DEFAULT_TYPE,
+                                      conf_id: int) -> None:
+        """Handles sending or editing the message to display the main confession view."""
+        text = get_confession_options_text(conf_id)
+        markup = get_confession_options_markup(conf_id)
+
+        if update.callback_query and update.callback_query.message:
+            if update.callback_query.message.caption:
+                await update.callback_query.edit_message_caption(caption=text,
+                                                              parse_mode="Markdown",
+                                                              reply_markup=markup)
+            else:
+                await update.callback_query.edit_message_text(text,
+                                                              parse_mode="Markdown",
+                                                              reply_markup=markup)
+        elif update.message:
+            await update.message.reply_text(text,
+                                            parse_mode="Markdown",
+                                            reply_markup=markup)
+        else:
+            logger.warning(
+                "Could not send confession options: Missing update context.")
+
+
+async def submit_pending_confession(update: Update,
+                                        context: ContextTypes.DEFAULT_TYPE,
+                                        text: str,
+                                        media_file_id: str = None,
+                                        media_type: str = None) -> None:
+        """Submits a new confession (with optional media) for admin review."""
+
+        conf_id: int = store['next_id']
+        pending_id: str = f"p{conf_id}"
+        user_id = update.effective_user.id
+        user_alias = get_user_alias(user_id)
+
+        store["next_id"] += 1
+
+        store["pending"][pending_id] = {
+            "id": conf_id,
+            "text": text,
+            "from_user": user_id,
+            "user_alias": user_alias,
+            "media_file_id": media_file_id,
+            "media_type": media_type
+        }
+        save_store()
+
+        flagged_words = check_auto_moderation(text)
+        moderation_badge = ""
+        if flagged_words:
+            moderation_badge = f"\n\n⚠️ *AUTO-FLAGGED FOR SENSITIVE KEYWORDS:* `{', '.join(flagged_words)}`\n"
+
+        admin_text = f"🆕 *Pending Confession #{conf_id}* (ID: {pending_id} | Alias: {user_alias}){moderation_badge}\n\n{text}"
+
+        keyboard = [[
+            InlineKeyboardButton("✅ Approve Confession",
+                                 callback_data=f"approve|{pending_id}"),
+            InlineKeyboardButton("❌ Reject Confession",
+                                 callback_data=f"reject|{pending_id}"),
+        ]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            if media_type == "photo":
+                await context.bot.send_photo(chat_id=ADMIN_GROUP_ID, photo=media_file_id, caption=admin_text, parse_mode="Markdown", reply_markup=markup)
+            elif media_type == "video":
+                await context.bot.send_video(chat_id=ADMIN_GROUP_ID, video=media_file_id, caption=admin_text, parse_mode="Markdown", reply_markup=markup)
+            elif media_type == "voice":
+                await context.bot.send_voice(chat_id=ADMIN_GROUP_ID, voice=media_file_id, caption=admin_text, parse_mode="Markdown", reply_markup=markup)
+            elif media_type == "audio":
+                await context.bot.send_audio(chat_id=ADMIN_GROUP_ID, audio=media_file_id, caption=admin_text, parse_mode="Markdown", reply_markup=markup)
+            elif media_type == "animation":
+                await context.bot.send_animation(chat_id=ADMIN_GROUP_ID, animation=media_file_id, caption=admin_text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=admin_text, parse_mode="Markdown", reply_markup=markup)
+
+            await update.message.reply_text(
+                "✅ Your confession has been received and is pending admin approval. You will not receive a further notification if it is posted."
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to send moderation message to admin group {ADMIN_GROUP_ID}: {e}"
+            )
+            await update.message.reply_text(
+                "⚠️ Error: Could not submit to the admin group. Please contact the administrator."
+            )
+            # Rollback ID and store
+            store["next_id"] -= 1
+            del store["pending"][pending_id]
+            save_store()
+            return
+
+
+
+    # ===== Core Handlers (Commands and Messages) =====
+
+
+async def start_command(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Greets the user, handles deep links for commenting, and explains the anonymous process (private chat only)."""
+        if update.effective_chat.type == Chat.PRIVATE:
+
+            if context.args and context.args[0].startswith("comment_"):
+                try:
+                    conf_id_str = context.args[0].split('_')[1]
+                    conf_id = int(conf_id_str)
+                    await send_confession_options(update, context, conf_id)
+                    return
+                except (IndexError, ValueError) as e:
+                    logger.error(f"Error processing deep link: {e}")
+
+            user_alias = get_user_alias(update.effective_user.id)
+
+            welcome_message = (
+                f"👋 *Welcome to the weirdo confession bot!* 🤫\n\n"
+                f"Your current nickname(Alias) is: *{user_alias}*\n"
+                "This bot allows you to share your thoughts, secrets, and stories completely anonymously in our channel (`{CHANNEL_ID}`).\n\n"
+                "*Here are the Rules & Guidelines:*\n"
+                "1. *Alias:* Use the `/setalias <name>` command to choose a stable nickname for your posts and comments.\n"
+                "2. *Anonymity:* Your Telegram user ID is never revealed. Only your chosen alias is displayed.\n"
+                "3. *Submission:* Use the `/confess` command, or simply send your message in this chat. It will be sent for review.\n"
+                "4. *Review:* All confessions are reviewed by administrators before being posted to the channel.\n"
+                "5. *NO Hate Speech:* Submissions must not contain hate speech, bullying, harassment, or discrimination.\n"
+                "6. *Respect Rights:* Do not submit content that violates the rights of any individual, including privacy or intellectual property.\n"
+                "7. *Interaction:* Use the buttons below posts in the channel to leave anonymous comments and react to other confessions.\n\n"
+                "Ready to share? Tap `/confess` or just start typing!")
+
+            await update.message.reply_text(welcome_message, parse_mode="Markdown")
+
+
+async def set_alias_command(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Allows the user to set a persistent nickname (alias)."""
+        if update.effective_chat.type != Chat.PRIVATE:
+            await update.message.reply_text(
+                "This command works only in a private chat with the bot.")
+            return
+
+        if not context.args:
+            current_alias = get_user_alias(update.effective_user.id)
+            await update.message.reply_text(
+                f"📝 Your current alias is: *{current_alias}*\n"
+                "Usage: `/setalias <new_nickname>`. Your nickname must be between 3 and 20 characters long and contain only letters, numbers, and spaces."
+            )
+            return
+
+        new_alias = " ".join(context.args).strip()
+
+        if len(new_alias) < 3 or len(new_alias) > 20:
+            await update.message.reply_text(
+                "❌ Nickname must be between 3 and 20 characters long.")
+            return
+
+        if not all(c.isalnum() or c.isspace() for c in new_alias):
+            await update.message.reply_text(
+                "❌ Nickname can only contain letters, numbers, and spaces.")
+            return
+
+        user_id_str = str(update.effective_user.id)
+        store["user_profiles"][user_id_str] = new_alias
+        save_store()
+
+        await update.message.reply_text(
+            f"✅ Your new alias has been set to: *{new_alias}*. This will be used for all future posts and comments.",
+            parse_mode="Markdown")
+
+
+async def help_command(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Provides a list of commands and general usage instructions."""
+        help_text = (
+            "*Welcome to the Confession Bot!* 🤫\n\n"
+            "**Public User Commands (Private Chat Only):**\n"
+            "1. `/setalias <name>`: Set your persistent nickname/alias.\n"
+            "2. `/confess`: Start submitting your anonymous confession.\n"
+            "3. `/feedback`: Send anonymous feedback or suggestions directly to the admins.\n"
+            "4. `/start`: Get the detailed welcome message and rules.\n"
+            "5. `/help`: Show this command summary.\n"
+            "6. `/cancel`: Cancel a pending comment or feedback submission.\n\n"
+            "**How to Interact:**\n"
+            f"Find a confession in the public channel (`{CHANNEL_ID}`) and click the 'Add / View Comments' button to interact."
+        )
+
+        if update.effective_chat.id == ADMIN_GROUP_ID:
+            help_text += (
+                "\n\n*Admin Commands (Admin Chat Only):*\n"
+                "1. `/pending`: List all confessions awaiting approval.\n"
+                f"2. `/approve_batch [N]`: Approve and post the next N (max {MAX_BATCH_APPROVAL}) pending confessions.\n"
+                f"3. `/reply <id> <message>`: Post an auto-approved anonymous comment to confession `<id>` (as `{ADMIN_ALIAS}`).\n"
+                "4. `/stats`: Show comment and vote statistics for all posted confessions.\n"
+                "5. `/deleteconfession <id>`: Permanently delete a posted confession and all its comments.\n"
+                "6. `/deletecomment <id> <index>`: Delete a specific comment by confession `<id>` and comment `<index>` (1-based).\n"
+                "7. `/reset_counter`: **DANGER** Clears ALL data and resets the counter to 1."
+            )
+
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def cancel_command(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cancels a pending comment or feedback submission."""
+        user_id = update.effective_user.id
+
+        # Check for state stored under user_id key
+        state_data = context.user_data.get(user_id, {})
+        state = state_data.get('state')
+
+        if state in [
+                'awaiting_reply', 'awaiting_feedback', 'awaiting_comment_reply'
+        ]:
+            del context.user_data[user_id]
+            await update.message.reply_text(
+                f"❌ Cancelled your {state.split('_')[-1]} submission.")
+            return
+
+        await update.message.reply_text("There is no active submission to cancel.")
+
+
+async def confess_command(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Prompts the user to send their confession message."""
+        if update.effective_chat.type == Chat.PRIVATE:
+            user_alias = get_user_alias(update.effective_user.id)
+            await update.message.reply_text(
+                f"📝 Please send your anonymous confession message now. Your current alias is *{user_alias}*."
+            )
+        else:
+            await update.message.reply_text(
+                "This command works only in a private chat with the bot.")
+
+
+async def feedback_command(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Initiates the feedback submission state for the user."""
+        if update.effective_chat.type == Chat.PRIVATE:
+            user_id = update.effective_user.id
+            context.user_data[user_id] = {'state': 'awaiting_feedback'}
+            await update.message.reply_text(
+                "📝 You are now submitting *anonymous feedback* to the admins. "
+                "Please send your message now.")
+        else:
+            await update.message.reply_text(
+                "This command works only in a private chat with the bot.")
+
+
+async def handle_confession(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Receives a message from a private chat and handles it as a comment, feedback, or new confession (supports text/media)."""
+        user_id = update.effective_user.id
+        user_alias = get_user_alias(user_id)
+        
+        # Check text or caption
+        text: str = ""
+        if update.message.text:
+            text = update.message.text.strip()
+        elif update.message.caption:
+            text = update.message.caption.strip()
+
+        # Capture media
+        media_file_id: str = None
+        media_type: str = None
+
+        if update.message.photo:
+            media_file_id = update.message.photo[-1].file_id
+            media_type = "photo"
+        elif update.message.video:
+            media_file_id = update.message.video.file_id
+            media_type = "video"
+        elif update.message.voice:
+            media_file_id = update.message.voice.file_id
+            media_type = "voice"
+        elif update.message.audio:
+            media_file_id = update.message.audio.file_id
+            media_type = "audio"
+        elif update.message.animation:
+            media_file_id = update.message.animation.file_id
+            media_type = "animation"
+
+        # Check for empty submission
+        if not text and not media_file_id:
+            await update.message.reply_text(
+                "Please send text or a supported media file (photo, video, voice, audio, GIF) for your confession."
+            )
+            return
+
+        user_state = context.user_data.get(user_id)
+        is_submitting_confession = not user_state or user_state.get('state') not in ['awaiting_reply', 'awaiting_comment_reply', 'awaiting_feedback']
+
+        # Rate Limit Check
+        if is_submitting_confession:
+            now = time.time()
+            if user_id in last_submission_time:
+                elapsed = now - last_submission_time[user_id]
+                if elapsed < RATE_LIMIT_SECONDS:
+                    remaining = int(RATE_LIMIT_SECONDS - elapsed)
+                    await update.message.reply_text(
+                        f"☕ *Slow down!* Please wait {remaining} seconds before sending another confession.",
+                        parse_mode="Markdown"
+                    )
+                    return
+            last_submission_time[user_id] = now
+
+        # State: Awaiting Reply (to an original Confession)
+        if user_state and user_state.get('state') == 'awaiting_reply':
+            conf_id_to_reply_to = user_state.get('conf_id')
+            del context.user_data[user_id]
+
+            if conf_id_to_reply_to is None:
+                await update.message.reply_text("⚠️ Cannot submit comment: Invalid context.")
+                return
+
+            conf_key = str(conf_id_to_reply_to)
+            if conf_key not in store["posted"]:
+                await update.message.reply_text("⚠️ Cannot submit comment: The confession no longer exists.")
+                return
+
+            reply_id = store['next_id']
+            store["next_id"] += 1
+
+            posted_confession = store["posted"][conf_key]
+            if "replies" not in posted_confession:
+                posted_confession["replies"] = []
+
+            posted_confession["replies"].append({
+                "reply_id": reply_id,
+                "text": text if text else "[Media/No Text]",
+                "user_alias": user_alias,
+                "approved_time": update.message.date.astimezone(utc).isoformat(),
+                "voters": {}
+            })
+            save_store()
+
+            # Show updated comments page
+            new_index = len(posted_confession["replies"]) - 1
+            page_text, page_markup = get_comment_page_text_and_markup(conf_id_to_reply_to, new_index, user_id)
+            await update.message.reply_text("✅ Your comment has been posted!")
+            await update.message.reply_text(page_text, parse_mode="Markdown", reply_markup=page_markup)
+            return
+
+        # State: Awaiting Comment Reply (to an existing Comment)
+        if user_state and user_state.get('state') == 'awaiting_comment_reply':
+            target_conf_id = user_state.get('conf_id')
+            target_reply_id = user_state.get('reply_id')
+            index = user_state.get('index', 0)
+            del context.user_data[user_id]
+
+            if target_conf_id is None or target_reply_id is None:
+                await update.message.reply_text("⚠️ Cannot submit reply: Invalid context.")
+                return
+
+            conf_key = str(target_conf_id)
+            if conf_key not in store["posted"]:
+                await update.message.reply_text("⚠️ The original confession no longer exists.")
+                return
+
+            replies = store["posted"][conf_key]["replies"]
+            target_comment_index = -1
+            for i, reply in enumerate(replies):
+                if reply.get('reply_id') == target_reply_id:
+                    target_comment_index = i
+                    break
+
+            if target_comment_index == -1:
+                await update.message.reply_text("⚠️ The comment you are replying to no longer exists.")
+                return
+
+            replying_to_alias = replies[target_comment_index].get('user_alias', 'Anonymous')
+            reply_text_full = f"*Reply to {replying_to_alias}:* {text if text else '[Media/No Text]'}"
+
+            new_reply_id = store['next_id']
+            store["next_id"] += 1
+
+            replies.append({
+                "reply_id": new_reply_id,
+                "text": reply_text_full,
+                "user_alias": user_alias,
+                "approved_time": update.message.date.astimezone(utc).isoformat(),
+                "voters": {}
+            })
+            save_store()
+
+            new_index = len(replies) - 1
+            page_text, page_markup = get_comment_page_text_and_markup(target_conf_id, new_index, user_id)
+            await update.message.reply_text("✅ Your reply has been posted!")
+            await update.message.reply_text(page_text, parse_mode="Markdown", reply_markup=page_markup)
+            return
+
+        # State: Awaiting Feedback
+        if user_state and user_state.get('state') == 'awaiting_feedback':
+            del context.user_data[user_id]
+
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    text=f"✉️ *New Anonymous Feedback*\n\n{text}",
+                    parse_mode="Markdown",
+                )
+                await update.message.reply_text("✅ Your feedback has been sent to the administrators. Thank you!")
+            except Exception as e:
+                logger.error(f"Failed to send feedback to admin group: {e}")
+                await update.message.reply_text("⚠️ Error: Could not send feedback. Please try again later.")
+            return
+
+        # Default: New Confession
+        await submit_pending_confession(update, context, text, media_file_id, media_type)
+
+
+async def handle_callbacks(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handles inline button presses."""
+        query = update.callback_query
+        await query.answer()
+
+        action_data = query.data.split("|")
+
+        # --- 1. Channel Reactions ---
+        if action_data[0] in ["like_conf", "dislike_conf"]:
+            action = action_data[0]
+            conf_id_str = action_data[1]
+            user_id = str(update.effective_user.id)
+
+            conf_key = str(conf_id_str)
+            if conf_key not in store["posted"]:
+                await query.answer("⚠️ Confession not found.")
+                return
+
+            posted_conf = store["posted"][conf_key]
+            if "voters" not in posted_conf:
+                posted_conf["voters"] = {}
+            voters = posted_conf["voters"]
+
+            vote_type = "like" if action == "like_conf" else "dislike"
+            previous_vote = voters.get(user_id)
+
+            if previous_vote == vote_type:
+                del voters[user_id]
+                message_text = "Vote removed!"
+            elif previous_vote and previous_vote != vote_type:
+                voters[user_id] = vote_type
+                message_text = f"Vote changed to {vote_type}!"
+            else:
+                voters[user_id] = vote_type
+                message_text = "Vote counted!"
+
+            posted_conf["voters"] = voters
+            save_store()
+
+            likes = sum(1 for v in voters.values() if v == 'like')
+            dislikes = sum(1 for v in voters.values() if v == 'dislike')
+
+            bot_info = await context.bot.get_me()
+            bot_username = bot_info.username
+
+            reply_keyboard = [
+                [
+                    InlineKeyboardButton(f"👍 Like ({likes})", callback_data=f"like_conf|{conf_id_str}"),
+                    InlineKeyboardButton(f"👎 Dislike ({dislikes})", callback_data=f"dislike_conf|{conf_id_str}")
+                ],
+                [
+                    InlineKeyboardButton("💬 Add / View Comments", url=f"https://t.me/{bot_username}?start=comment_{conf_id_str}")
+                ]
+            ]
+            try:
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(reply_keyboard))
+            except Exception as e:
+                logger.error(f"Failed to update channel reply markup: {e}")
+
+            await query.answer(message_text)
+            return
+
+        # --- 2. Public Comment Interactivity ---
+        if action_data[0] == "browse_comments":
+            conf_id = int(action_data[1])
+            index = int(action_data[2]) if len(action_data) > 2 else 0
+            text, markup = get_comment_page_text_and_markup(conf_id, index, query.from_user.id)
+            if query.message.caption:
+                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+            return
+
+        if action_data[0] == "vote_comment":
+            conf_id = int(action_data[1])
+            reply_id = int(action_data[2])
+            vote_type = action_data[3]
+            index = int(action_data[4])
+            user_id = str(query.from_user.id)
+
+            conf_key = str(conf_id)
+            if conf_key not in store["posted"]:
+                await query.answer("Confession not found.")
+                return
+
+            replies = store["posted"][conf_key].get("replies", [])
+            target_reply = None
+            for r in replies:
+                if r.get('reply_id') == reply_id:
+                    target_reply = r
+                    break
+
+            if not target_reply:
+                await query.answer("Comment not found.")
+                return
+
+            voters = target_reply.get('voters', {})
+            previous_vote = voters.get(user_id)
+
+            if previous_vote == vote_type:
+                del voters[user_id]
+                message_text = "Vote removed!"
+            elif previous_vote and previous_vote != vote_type:
+                voters[user_id] = vote_type
+                message_text = f"Vote changed to '{vote_type}'!"
+            else:
+                voters[user_id] = vote_type
+                message_text = f"{vote_type.capitalize()} counted!"
+
+            target_reply['voters'] = voters
+            save_store()
+
+            text, markup = get_comment_page_text_and_markup(conf_id, index, query.from_user.id)
+            if query.message.caption:
+                await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+            await query.answer(message_text)
+            return
+
+        if action_data[0] == "reply_comment":
+            conf_id = int(action_data[1])
+            reply_id = int(action_data[2])
+            index = int(action_data[3])
+            user_id = query.from_user.id
+            user_alias = get_user_alias(user_id)
+
+            context.user_data[user_id] = {
+                'state': 'awaiting_comment_reply',
+                'conf_id': conf_id,
+                'reply_id': reply_id,
+                'index': index
+            }
+
+            conf_key = str(conf_id)
+            replies = store["posted"][conf_key].get("replies", [])
+            target_reply = None
+            for r in replies:
+                if r.get('reply_id') == reply_id:
+                    target_reply = r
+                    break
+
+            if not target_reply:
+                await query.answer("Comment not found.")
+                return
+
+            comment_author_alias = target_reply.get('user_alias', 'Anonymous')
+            response_text = (
+                f"💬 *You are submitting a REPLY to {comment_author_alias}'s comment:*\n"
+                f"> _{target_reply['text']}_\n\n"
+                f"Your alias for this reply: *{user_alias}*\n\n"
+                f"Please send your reply message now. Or `/cancel` to abort."
+            )
+            if query.message.caption:
+                await query.edit_message_caption(caption=response_text, parse_mode="Markdown")
+            else:
+                await query.edit_message_text(response_text, parse_mode="Markdown")
+            return
+
+        if action_data[0] in ["view_confession", "add_comment"]:
+            action, data_id = action_data[0], action_data[1]
+            try:
+                conf_id = int(data_id)
+            except (IndexError, ValueError):
+                await query.answer("Invalid confession ID.")
+                return
+
+            confession_data = store["posted"].get(str(conf_id))
+            if not confession_data:
+                await query.answer("⚠️ Confession not found.")
+                return
+
+            if action == "view_confession":
+                await send_confession_options(update, context, conf_id)
+                return
+
+            elif action == "add_comment":
+                user_id = update.effective_user.id
+                user_alias = get_user_alias(user_id)
+
+                context.user_data[user_id] = {
+                    'state': 'awaiting_reply',
+                    'conf_id': conf_id
+                }
+
+                response_text = (
+                    f"💬 *You are submitting a comment to Confession #{conf_id}* (as *{user_alias}*):\n\n"
+                    f"> _{confession_data['text'][:150]}..._\n\n"
+                    f"Please send your comment now."
+                )
+                if query.message.caption:
+                    await query.edit_message_caption(caption=response_text, parse_mode="Markdown")
+                else:
+                    await query.edit_message_text(response_text, parse_mode="Markdown")
+                return
+
+        # --- 3. Admin Actions ---
+        if query.message.chat.id != ADMIN_GROUP_ID:
+            return
+
+        if action_data[0] in ["approve", "reject"]:
+            if len(action_data) != 2: return
+            action, data_id = action_data
+
+            if data_id not in store["pending"]:
+                orig = query.message.caption if query.message.caption else query.message.text
+                new_text = (orig if orig else "") + "\n\n⚠️ *Already Handled*"
+                if query.message.caption:
+                    await query.edit_message_caption(caption=new_text, parse_mode="Markdown")
+                else:
+                    await query.edit_message_text(text=new_text, parse_mode="Markdown")
+                return
+
+            pending_item = store["pending"][data_id]
+            conf_id = pending_item["id"]
+            conf_alias = pending_item["user_alias"]
+
+            orig_text = query.message.caption if query.message.caption else query.message.text
+            if not orig_text:
+                orig_text = ""
+
+            success_text = orig_text + f"\n\n✅ *Approved by {update.effective_user.first_name}*"
+            reject_text = orig_text + f"\n\n❌ *Rejected by {update.effective_user.first_name}*"
+
+            if action == "reject":
+                del store["pending"][data_id]
+                save_store()
+                if query.message.caption:
+                    await query.edit_message_caption(caption=reject_text, parse_mode="Markdown")
+                else:
+                    await query.edit_message_text(text=reject_text, parse_mode="Markdown")
+
+            elif action == "approve":
+                conf = store["pending"].pop(data_id)
+
+                temp_conf_data = {
+                    "text": conf["text"],
+                    "user_alias": conf_alias,
+                    "post_time": update.callback_query.message.date.astimezone(utc).isoformat(),
+                    "replies": [],
+                    "channel_message_id": None,
+                    "media_file_id": conf.get("media_file_id"),
+                    "media_type": conf.get("media_type"),
+                    "voters": {}
+                }
+                store["posted"][str(conf_id)] = temp_conf_data
+                save_store()
+
+                bot_info = await context.bot.get_me()
+                bot_username = bot_info.username
+
+                reply_keyboard = [
+                    [
+                        InlineKeyboardButton("👍 Like (0)", callback_data=f"like_conf|{conf_id}"),
+                        InlineKeyboardButton("👎 Dislike (0)", callback_data=f"dislike_conf|{conf_id}")
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "💬 Add / View Comments",
+                            url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
+                    ]
+                ]
+                post_text = f"*#{conf_id} Confession* - Posted by: {conf_alias}\n\n{conf['text']}"
+                
+                media_file_id = conf.get("media_file_id")
+                media_type = conf.get("media_type")
+
+                try:
+                    if media_type == "photo":
+                        sent_message = await context.bot.send_photo(
+                            chat_id=CHANNEL_ID, photo=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                    elif media_type == "video":
+                        sent_message = await context.bot.send_video(
+                            chat_id=CHANNEL_ID, video=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                    elif media_type == "voice":
+                        sent_message = await context.bot.send_voice(
+                            chat_id=CHANNEL_ID, voice=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                    elif media_type == "audio":
+                        sent_message = await context.bot.send_audio(
+                            chat_id=CHANNEL_ID, audio=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                    elif media_type == "animation":
+                        sent_message = await context.bot.send_animation(
+                            chat_id=CHANNEL_ID, animation=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                    else:
+                        sent_message = await context.bot.send_message(
+                            chat_id=CHANNEL_ID, text=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+
+                    store["posted"][str(conf_id)]["channel_message_id"] = sent_message.message_id
+                    save_store()
+
+                    post_link = sent_message.link if sent_message.link else f"https://t.me/{CHANNEL_ID.lstrip('@')}/{sent_message.message_id}"
+
+                    if query.message.caption:
+                        await query.edit_message_caption(caption=success_text + f"\n\n🔗 [View Post in Channel]({post_link})", parse_mode="Markdown")
+                    else:
+                        await query.edit_message_text(text=success_text + f"\n\n🔗 [View Post in Channel]({post_link})", parse_mode="Markdown")
+
+                except Exception as e:
+                    logger.error(f"Failed to post Confession #{conf_id} to channel {CHANNEL_ID}: {e}")
+                    del store["posted"][str(conf_id)]
+                    store["pending"][data_id] = conf
+                    save_store()
+                    
+                    err_msg = orig_text + f"\n\n❌ *Approval Failed: Could not post. Reverted.* Error: {e}"
+                    if query.message.caption:
+                        await query.edit_message_caption(caption=err_msg, parse_mode="Markdown")
+                    else:
+                        await query.edit_message_text(text=err_msg, parse_mode="Markdown")
+            return
+
+
+    # ===== Admin Commands Implementation =====
+
+
+@is_admin_chat
+async def pending_command(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Lists all pending confessions for the admins."""
+        pending_list = store["pending"].values()
+        pending_count = len(pending_list)
+
+        if pending_count == 0:
+            await update.message.reply_text("✅ No confessions are currently pending review.")
+            return
+
+        message = f"📋 *{pending_count} Confessions Awaiting Review:*\n\n"
+
+        # Sort by ID for consistent ordering
+        sorted_pending = sorted(pending_list, key=lambda x: x['id'])
+
+        for i, conf in enumerate(sorted_pending):
+            conf_id = conf['id']
+            pending_id = f"p{conf_id}"
+            alias = conf['user_alias']
+
+            # Truncate text for summary view
+            text_summary = conf['text'][:50].replace('\n', ' ')
+            if len(conf['text']) > 50:
+                text_summary += "..."
+
+            message += f"*{i+1}.* ID: `{pending_id}` (Alias: {alias})\n"
+            message += f"   Text: _{text_summary}_\n\n"
+
+            # Telegram message limit is ~4096 characters. Stop if message gets too long.
+            if len(message) > 3500:
+                message += f"... and {pending_count - i - 1} more confessions. Use /approve_batch to process them quickly."
+                break
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+
+
+@is_admin_chat
+async def approve_batch_command(update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Approves and posts a batch of pending confessions to the channel."""
+
+        pending_items: List[Dict[str, Any]] = list(store["pending"].values())
+        pending_count = len(pending_items)
+
+        if pending_count == 0:
+            await update.message.reply_text("✅ No confessions are currently pending review.")
+            return
+
+        # Determine batch size
+        batch_size = MAX_BATCH_APPROVAL
+        if context.args:
+            try:
+                requested_size = int(context.args[0])
+                batch_size = min(requested_size, MAX_BATCH_APPROVAL)
+            except ValueError:
+                pass # Use default batch size if argument is invalid
+
+        batch_to_approve = sorted(pending_items, key=lambda x: x['id'])[:batch_size]
+
+        approved_count = 0
+        failed_ids = []
+
+        await update.message.reply_text(f"🚀 Attempting to approve and post *{len(batch_to_approve)}* confessions...", parse_mode="Markdown")
+
+        # Prep for batch posting
+        bot_info = await context.bot.get_me()
+        bot_username = bot_info.username
+        admin_name = update.effective_user.first_name
+
+        for conf in batch_to_approve:
+            conf_id = conf['id']
+            pending_id = f"p{conf_id}"
+            conf_alias = conf.get("user_alias", "Anonymous")
+
+            # Remove from pending store
+            if pending_id in store["pending"]:
+                del store["pending"][pending_id]
+            else:
+                # Should not happen in a batch loop, but as a guard
+                continue 
+
+            temp_conf_data = {
+                "text": conf["text"],
+                "user_alias": conf_alias,
+                "post_time": datetime.now(utc).isoformat(),
+                "replies": [],
+                "channel_message_id": None,
+                "media_file_id": conf.get("media_file_id"),
+                "media_type": conf.get("media_type"),
+                "voters": {}
+            }
+            store["posted"][str(conf_id)] = temp_conf_data
+
+            reply_keyboard = [
+                [
+                    InlineKeyboardButton("👍 Like (0)", callback_data=f"like_conf|{conf_id}"),
+                    InlineKeyboardButton("👎 Dislike (0)", callback_data=f"dislike_conf|{conf_id}")
+                ],
+                [
+                    InlineKeyboardButton(
+                        "💬 Add / View Comments",
+                        url=f"https://t.me/{bot_username}?start=comment_{conf_id}")
+                ]
+            ]
+            post_text = f"*#{conf_id} Confession* - Posted by: {conf_alias}\n\n{conf['text']}"
+
+            media_file_id = conf.get("media_file_id")
+            media_type = conf.get("media_type")
+
+            try:
+                if media_type == "photo":
+                    sent_message = await context.bot.send_photo(
+                        chat_id=CHANNEL_ID, photo=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                elif media_type == "video":
+                    sent_message = await context.bot.send_video(
+                        chat_id=CHANNEL_ID, video=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                elif media_type == "voice":
+                    sent_message = await context.bot.send_voice(
+                        chat_id=CHANNEL_ID, voice=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                elif media_type == "audio":
+                    sent_message = await context.bot.send_audio(
+                        chat_id=CHANNEL_ID, audio=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                elif media_type == "animation":
+                    sent_message = await context.bot.send_animation(
+                        chat_id=CHANNEL_ID, animation=media_file_id, caption=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+                else:
+                    sent_message = await context.bot.send_message(
+                        chat_id=CHANNEL_ID, text=post_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(reply_keyboard))
+
+                # Update posted data with channel message ID
+                store["posted"][str(conf_id)]["channel_message_id"] = sent_message.message_id
+                approved_count += 1
+
+            except Exception as e:
+                logger.error(f"Failed to post Confession #{conf_id} during batch: {e}")
+                failed_ids.append(conf_id)
+                # Revert the item back to pending since posting failed
+                store["pending"][pending_id] = conf
+                del store["posted"][str(conf_id)] # Remove failed post from 'posted'
+
+        save_store()
+
+        # Final Summary Message
+        summary_message = f"✅ *Batch Approval Complete (by {admin_name})*\n"
+        summary_message += f"Posted successfully: *{approved_count}* confession(s).\n"
+        summary_message += f"Remaining pending: *{len(store['pending'])}*.\n"
+
+        if failed_ids:
+            summary_message += f"⚠️ *Failed to Post:* {', '.join(map(str, failed_ids))} (Check bot permissions).\n"
+
+        await update.message.reply_text(summary_message, parse_mode="Markdown")
+
+
+@is_admin_chat
+async def reply_command(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin command to post an instant, anonymous comment (as 'Admin')."""
+
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                f"Usage: `/reply <confession_id> <message>`. Posts a comment as *{ADMIN_ALIAS}*.",
+                parse_mode="Markdown")
+            return
+
+        try:
+            conf_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid confession ID format.")
+            return
+
+        conf_key = str(conf_id)
+        if conf_key not in store["posted"]:
+            await update.message.reply_text(
+                f"❌ Confession #{conf_id} not found in posted confessions.")
+            return
+
+        comment_text = " ".join(context.args[1:])
+
+        reply_id = store['next_id']
+        store["next_id"] += 1
+
+        posted_confession = store["posted"][conf_key]
+        if "replies" not in posted_confession:
+            posted_confession["replies"] = []
+
+        posted_confession["replies"].append({
+            "reply_id": reply_id,
+            "text": comment_text,
+            "user_alias": ADMIN_ALIAS,  # Post as Admin
+            "approved_time": datetime.now(utc).isoformat(),
+            "voters": {}
+        })
+        save_store()
+
+        await update.message.reply_text(
+            f"✅ Admin comment posted to Confession #{conf_id} (ID: {reply_id}).\n\nComment: _{comment_text}_",
+            parse_mode="Markdown")
+
+
+@is_admin_chat
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Displays bot and channel statistics for administrators."""
+    total_posted = len(store.get("posted", {}))
+    total_pending = len(store.get("pending", {}))
+    
+    total_comments = 0
+    confessions_with_comments = 0
+    top_commented = []
+    top_liked_confessions = []
+
+    for conf_id, data in store.get("posted", {}).items():
+        replies_count = len(data.get("replies", []))
+        total_comments += replies_count
+        if replies_count > 0:
+            confessions_with_comments += 1
+            top_commented.append((conf_id, replies_count, data.get("text", "")[:40]))
+        
+        # Calculate confession votes
+        voters = data.get("voters", {})
+        likes = sum(1 for v in voters.values() if v == 'like')
+        dislikes = sum(1 for v in voters.values() if v == 'dislike')
+        net_score = likes - dislikes
+        top_liked_confessions.append((conf_id, net_score, likes, dislikes, data.get("text", "")[:40]))
+
+    # Sort to find top confessions
+    top_commented.sort(key=lambda x: x[1], reverse=True)
+    top_liked_confessions.sort(key=lambda x: x[1], reverse=True)
+
+    stats_text = (
+        "📊 *Telegram Confession Bot Statistics*\n\n"
+        f"🔹 *Total Confessions Posted:* `{total_posted}`\n"
+        f"🔹 *Total Confessions Pending:* `{total_pending}`\n"
+        f"🔹 *Total Comments Posted:* `{total_comments}`\n"
+        f"🔹 *Active Comment Ratio:* `{confessions_with_comments}/{total_posted}` confessions have comments.\n\n"
+    )
+
+    if top_liked_confessions:
+        stats_text += "🏆 *Top 3 Most Liked Confessions (Net Score):*\n"
+        for i, (conf_id, score, l, d, text) in enumerate(top_liked_confessions[:3], 1):
+            stats_text += f"{i}. *#{conf_id}* (Score: `{score}` | 👍{l} 👎{d}): _{text}..._\n"
+        stats_text += "\n"
+
+    if top_commented:
+        stats_text += "💬 *Top 3 Most Commented Confessions:*\n"
+        for i, (conf_id, count, text) in enumerate(top_commented[:3], 1):
+            stats_text += f"{i}. *#{conf_id}* (`{count}` comments): _{text}..._\n"
+    
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
+
+
+@is_admin_chat
+async def delete_confession_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+      """Admin command to delete a posted confession."""
+      if not context.args:
+          await update.message.reply_text("Usage: `/deleteconfession <id>`")
+          return
+      try:
+          conf_id = context.args[0]
+          if conf_id in store["posted"]:
+              # Delete the message in the channel if we can
+              conf_data = store["posted"][conf_id]
+              msg_id = conf_data.get("channel_message_id")
+              if msg_id:
+                  try:
+                      await context.bot.delete_message(chat_id=CHANNEL_ID, message_id=msg_id)
+                  except Exception as e:
+                      logger.warning(f"Could not delete message from channel: {e}")
+              del store["posted"][conf_id]
+              save_store()
+              await update.message.reply_text(f"✅ Confession #{conf_id} deleted successfully.")
+          else:
+              await update.message.reply_text("❌ Confession not found.")
+      except Exception as e:
+          await update.message.reply_text(f"❌ Error: {e}")
+
+
+@is_admin_chat
+async def delete_comment_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+      """Admin command to delete a specific comment (1-based index)."""
+      if len(context.args) < 2:
+          await update.message.reply_text("Usage: `/deletecomment <confession_id> <comment_index>`")
+          return
+      try:
+          conf_id = context.args[0]
+          comment_index = int(context.args[1]) - 1 # Convert to 0-based index
+          
+          if conf_id not in store["posted"]:
+              await update.message.reply_text("❌ Confession not found.")
+              return
+          
+          replies = store["posted"][conf_id].get("replies", [])
+          if comment_index < 0 or comment_index >= len(replies):
+              await update.message.reply_text(f"❌ Invalid comment index. Comment count: {len(replies)}")
+              return
+          
+          removed = replies.pop(comment_index)
+          save_store()
+          await update.message.reply_text(f"✅ Comment index {comment_index + 1} (ID: {removed.get('reply_id')}) removed.")
+      except Exception as e:
+          await update.message.reply_text(f"❌ Error: {e}")
+
+
+@is_admin_chat
+async def reset_counter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+      """Danger: clears the entire database and resets the ID counter."""
+      store["next_id"] = 1
+      store["pending"] = {}
+      store["posted"] = {}
+      store["user_profiles"] = {}
+      save_store()
+      await update.message.reply_text("⚠️ **Database has been completely reset.** Counter set to 1.")
+
+
+    # ===== Main Application Setup =====
+def main() -> None:
+        """Start the bot."""
+
+        if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+            logger.error("🚫 BOT_TOKEN is not set. Please replace the placeholder value.")
+            return
+
+        # Load persistent data first
+        load_store()
+
+        # Create the Application and pass it your bot's token.
+        application = Application.builder().token(BOT_TOKEN).build()
+
+        # --- Public Handlers ---
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("setalias", set_alias_command))
+        application.add_handler(CommandHandler("confess", confess_command))
+        application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("cancel", cancel_command))
+
+        # --- Admin Handlers ---
+        application.add_handler(CommandHandler("pending", pending_command))
+        application.add_handler(CommandHandler("approve_batch", approve_batch_command))
+        application.add_handler(CommandHandler("reply", reply_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("deleteconfession", delete_confession_command))
+        application.add_handler(CommandHandler("deletecomment", delete_comment_command))
+        application.add_handler(CommandHandler("reset_counter", reset_counter_command))
+
+        # --- Generic Handlers (Must come after Command Handlers) ---
+        # Handle incoming messages that are not commands in private chat
+        application.add_handler(
+            MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO | filters.ANIMATION)
+                & filters.ChatType.PRIVATE & ~filters.COMMAND,
+                handle_confession
+            )
+        )
+        # Handle all inline button callbacks
+        application.add_handler(CallbackQueryHandler(handle_callbacks))
+
+        # Add command list to bot for user convenience
+        commands = [
+            BotCommand("start", "Get started and see the rules"),
+            BotCommand("setalias", "Set your anonymous nickname"),
+            BotCommand("confess", "Submit an anonymous confession"),
+            BotCommand("feedback", "Send anonymous feedback to admins"),
+            BotCommand("cancel", "Cancel current comment/feedback submission"),
+        ]
+
+        # Run a separate thread for the Flask keep-alive server
+        keep_alive()
+
+        # Start the Bot
+        logger.info("Bot is running...")
+        application.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+        main()
