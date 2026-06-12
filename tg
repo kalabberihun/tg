@@ -180,32 +180,24 @@ def get_confession_options_markup(conf_id: int) -> InlineKeyboardMarkup:
 
 
 def get_comment_page_text_and_markup(conf_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Generates a clean, Telegram-style list of comments for a confession."""
+    """Generates a clean list of comments for a confession."""
     confession_data = store["posted"].get(str(conf_id))
     if not confession_data:
         return "⚠️ Confession not found.", None
 
-    conf_alias = confession_data.get("user_alias", "Anonymous")
     replies = confession_data.get("replies", [])
     
-    text = (
-        f"💬 *Confession #{conf_id}* (by {conf_alias}):\n"
-        f"_{confession_data['text']}_\n\n"
-        f"📢 *Comments ({len(replies)}):*\n"
-    )
-    
+    text = f"💬 *Comments ({len(replies)}):*\n\n"
     if not replies:
-        text += "_No comments yet. Be the first to share your thoughts!_"
+        text += "_No comments yet._\n"
     else:
         for reply in replies:
             alias = reply.get("user_alias", "Anonymous")
             comment_text = reply.get("text", "")
-            text += f"👤 *{alias}*: {comment_text}\n"
-
-    text += "\n✍️ *Send your comment directly in this chat to post it.*"
+            text += f"• *{alias}*: {comment_text}\n"
 
     keyboard = [
-        [InlineKeyboardButton("⬅️ Back to Confession Options", callback_data=f"view_confession|{conf_id}")]
+        [InlineKeyboardButton("❌ Close", callback_data="cancel_comment_flow")]
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -650,6 +642,9 @@ async def handle_callbacks(update: Update,
             except Exception:
                 pass
 
+            await query.answer(message_text)
+            return
+
         # --- 2. Public Comment Interactivity ---
         if action_data[0] == "browse_comments":
             conf_id = int(action_data[1])
@@ -666,6 +661,16 @@ async def handle_callbacks(update: Update,
                 await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=markup)
             else:
                 await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=markup)
+            return
+
+        if action_data[0] == "cancel_comment_flow":
+            user_id = query.from_user.id
+            if user_id in context.user_data:
+                del context.user_data[user_id]
+            if query.message.caption:
+                await query.edit_message_caption(caption="❌ Comment session closed.")
+            else:
+                await query.edit_message_text(text="❌ Comment session closed.")
             return
 
         if action_data[0] == "view_confession":
