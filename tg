@@ -62,6 +62,9 @@ ADMIN_GROUP_ID = int(os.environ.get("ADMIN_GROUP_ID", "-1003301880047"))
 DATA_FILE = "confessions_store.json"
 ADMIN_ALIAS = "Admin"
 MAX_BATCH_APPROVAL = 15
+AVAILABLE_HASHTAGS = [
+    "#schools", "#weird", "#crush", "#dating", "#academic", "#funny", "#rant", "#advice", "#question"
+]
     # =================================================
 
     # ===== Rate Limiting & Auto-Moderation =====
@@ -248,6 +251,50 @@ async def browse_comments_action(update: Update, context: ContextTypes.DEFAULT_T
             sent_message_ids[r_id] = sent_msg.message_id
 
 
+def get_tag_selection_markup(selected_tags: List[str]) -> InlineKeyboardMarkup:
+    """Generates the inline keyboard for choosing hashtags."""
+    keyboard = []
+    row = []
+    for tag in AVAILABLE_HASHTAGS:
+        is_selected = tag in selected_tags
+        label = f"✅ {tag}" if is_selected else tag
+        row.append(InlineKeyboardButton(label, callback_data=f"toggle_tag|{tag}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([
+        InlineKeyboardButton("❌ Cancel Submission", callback_data="cancel_tag_selection"),
+        InlineKeyboardButton("➡️ Done & Submit", callback_data="submit_tags")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_tag_selection_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: dict) -> None:
+    """Prompts the user to select hashtags for their confession."""
+    selected_tags = user_data.get('selected_tags', [])
+    tags_preview = " ".join(selected_tags) if selected_tags else "None selected"
+    
+    text = (
+        "🏷️ *Add Hashtags to your Confession!*\n\n"
+        f"Selected tags: `{tags_preview}`\n\n"
+        "Click the buttons below to toggle tags. When you are done, tap *Done & Submit*."
+    )
+    
+    markup = get_tag_selection_markup(selected_tags)
+    
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+    else:
+        await update.effective_message.reply_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+
+
 def get_confession_options_text(conf_id: int) -> str:
         """Generates the full text for the main confession view."""
         confession_data = store["posted"].get(str(conf_id))
@@ -308,8 +355,9 @@ async def submit_pending_confession(update: Update,
                                         context: ContextTypes.DEFAULT_TYPE,
                                         text: str,
                                         media_file_id: str = None,
-                                        media_type: str = None) -> None:
-        """Submits a new confession (with optional media) for admin review."""
+                                        media_type: str = None,
+                                        tags: List[str] = None) -> None:
+        """Submits a new confession (with optional media and tags) for admin review."""
 
         conf_id: int = store['next_id']
         pending_id: str = f"p{conf_id}"
@@ -324,7 +372,8 @@ async def submit_pending_confession(update: Update,
             "from_user": user_id,
             "user_alias": user_alias,
             "media_file_id": media_file_id,
-            "media_type": media_type
+            "media_type": media_type,
+            "tags": tags or []
         }
         save_store()
 
@@ -333,7 +382,9 @@ async def submit_pending_confession(update: Update,
         if flagged_words:
             moderation_badge = f"\n\n⚠️ *AUTO-FLAGGED FOR SENSITIVE KEYWORDS:* `{', '.join(flagged_words)}`\n"
 
-        admin_text = f"🆕 *Pending Confession #{conf_id}* (ID: {pending_id} | Alias: {user_alias}){moderation_badge}\n\n{text}"
+        tags_str = " ".join(tags) if tags else ""
+        tags_badge = f"\n\n🏷️ *Tags:* {tags_str}" if tags else ""
+        admin_text = f"🆕 *Pending Confession #{conf_id}* (ID: {pending_id} | Alias: {user_alias}){moderation_badge}{tags_badge}\n\n{text}"
 
         keyboard = [[
             InlineKeyboardButton("✅ Approve Confession",
@@ -534,11 +585,12 @@ async def cancel_command(update: Update,
         state = state_data.get('state')
 
         if state in [
-                'awaiting_reply', 'awaiting_feedback', 'awaiting_comment_reply'
+                'awaiting_reply', 'awaiting_feedback', 'awaiting_comment_reply', 'selecting_tags'
         ]:
             del context.user_data[user_id]
+            state_display = "confession" if state == "selecting_tags" else state.split('_')[-1]
             await update.message.reply_text(
-                f"❌ Cancelled your {state.split('_')[-1]} submission.")
+                f"❌ Cancelled your {state_display} submission.")
             return
 
         await update.message.reply_text("There is no active submission to cancel.")
@@ -710,8 +762,15 @@ async def handle_confession(update: Update,
                 await update.message.reply_text("⚠️ Error: Could not send feedback. Please try again later.")
             return
 
-        # Default: New Confession
-        await submit_pending_confession(update, context, text, media_file_id, media_type)
+        # Default: New Confession (Initiate hashtag selection flow)
+        context.user_data[user_id] = {
+            'state': 'selecting_tags',
+            'text': text,
+            'media_file_id': media_file_id,
+            'media_type': media_type,
+            'selected_tags': []
+        }
+        await send_tag_selection_message(update, context, context.user_data[user_id])
 
 
 async def handle_callbacks(update: Update,
@@ -721,6 +780,55 @@ async def handle_callbacks(update: Update,
         await query.answer()
 
         action_data = query.data.split("|")
+
+        # --- Hashtag Selection Handlers ---
+        if action_data[0] == "toggle_tag":
+            tag = action_data[1]
+            user_id = query.from_user.id
+            user_data = context.user_data.get(user_id)
+            if user_data and user_data.get('state') == 'selecting_tags':
+                selected_tags = user_data.setdefault('selected_tags', [])
+                if tag in selected_tags:
+                    selected_tags.remove(tag)
+                else:
+                    selected_tags.append(tag)
+                await send_tag_selection_message(update, context, user_data)
+            return
+
+        if action_data[0] == "submit_tags":
+            user_id = query.from_user.id
+            user_data = context.user_data.get(user_id)
+            if user_data and user_data.get('state') == 'selecting_tags':
+                text = user_data.get('text', '')
+                media_file_id = user_data.get('media_file_id')
+                media_type = user_data.get('media_type')
+                selected_tags = user_data.get('selected_tags', [])
+                
+                # Clean up user state first
+                del context.user_data[user_id]
+                
+                # Delete selection message
+                try:
+                    await query.message.delete()
+                except Exception as e:
+                    logger.warning(f"Could not delete tag selection message: {e}")
+                
+                # Submit confession
+                await submit_pending_confession(
+                    update, context, text, media_file_id, media_type, tags=selected_tags
+                )
+            return
+
+        if action_data[0] == "cancel_tag_selection":
+            user_id = query.from_user.id
+            if user_id in context.user_data:
+                del context.user_data[user_id]
+            try:
+                await query.message.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete tag selection message: {e}")
+            await query.message.reply_text("❌ Confession submission cancelled.")
+            return
 
         # --- 1. Public Comment Interactivity ---
         if action_data[0] == "browse_comments":
@@ -979,7 +1087,8 @@ async def handle_callbacks(update: Update,
                     "channel_message_id": None,
                     "media_file_id": conf.get("media_file_id"),
                     "media_type": conf.get("media_type"),
-                    "voters": {}
+                    "voters": {},
+                    "tags": conf.get("tags", [])
                 }
                 store["posted"][str(conf_id)] = temp_conf_data
                 save_store()
@@ -1001,7 +1110,12 @@ async def handle_callbacks(update: Update,
                         )
                     ]
                 ]
-                post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
+                
+                tags_list = conf.get("tags", [])
+                if tags_list:
+                    post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}\n\n{' '.join(tags_list)}"
+                else:
+                    post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
                 
                 media_file_id = conf.get("media_file_id")
                 media_type = conf.get("media_type")
@@ -1143,7 +1257,8 @@ async def approve_batch_command(update: Update,
                 "channel_message_id": None,
                 "media_file_id": conf.get("media_file_id"),
                 "media_type": conf.get("media_type"),
-                "voters": {}
+                "voters": {},
+                "tags": conf.get("tags", [])
             }
             store["posted"][str(conf_id)] = temp_conf_data
 
@@ -1161,7 +1276,12 @@ async def approve_batch_command(update: Update,
                     )
                 ]
             ]
-            post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
+            
+            tags_list = conf.get("tags", [])
+            if tags_list:
+                post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}\n\n{' '.join(tags_list)}"
+            else:
+                post_text = f"*#{conf_id}* — {conf_alias}\n\n{conf['text']}"
 
             media_file_id = conf.get("media_file_id")
             media_type = conf.get("media_type")
