@@ -723,13 +723,7 @@ async def handle_confession(update: Update,
                     updated_keyboard = [
                         [
                             InlineKeyboardButton(
-                                "➕ Add Comment",
-                                url=f"https://t.me/{bot_username}?start=addcomment_{conf_id_to_reply_to}"
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"💬 Browse Comments ({replies_count})",
+                                f"💬 Comments ({replies_count})",
                                 url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id_to_reply_to}"
                             )
                         ]
@@ -1099,13 +1093,7 @@ async def handle_callbacks(update: Update,
                 reply_keyboard = [
                     [
                         InlineKeyboardButton(
-                            "➕ Add Comment",
-                            url=f"https://t.me/{bot_username}?start=addcomment_{conf_id}"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "💬 Browse Comments (0)",
+                            "💬 Comments (0)",
                             url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id}"
                         )
                     ]
@@ -1265,13 +1253,7 @@ async def approve_batch_command(update: Update,
             reply_keyboard = [
                 [
                     InlineKeyboardButton(
-                        "➕ Add Comment",
-                        url=f"https://t.me/{bot_username}?start=addcomment_{conf_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "💬 Browse Comments (0)",
+                        "💬 Comments (0)",
                         url=f"https://t.me/{bot_username}?start=browsecomments_{conf_id}"
                     )
                 ]
