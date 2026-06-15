@@ -96,7 +96,7 @@ NOUNS = [
 ]
 
     # ===== Persistent Storage (Local JSON) =====
-store: dict = {"next_id": 1, "pending": {}, "posted": {}, "user_profiles": {}}
+store: dict = {"next_id": 1, "next_reply_id": 1, "pending": {}, "posted": {}, "user_profiles": {}}
 
 
 def load_store():
@@ -695,8 +695,8 @@ async def handle_confession(update: Update,
                 await update.message.reply_text("⚠️ Cannot submit comment: The confession no longer exists.")
                 return
  
-            reply_id = store['next_id']
-            store["next_id"] += 1
+            reply_id = store.get('next_reply_id', 1)
+            store["next_reply_id"] = reply_id + 1
  
             posted_confession = store["posted"][conf_key]
             if "replies" not in posted_confession:
@@ -993,6 +993,7 @@ async def handle_callbacks(update: Update,
         # Database confirmation / restore actions
         if action_data[0] == "confirm_reset_db":
             store["next_id"] = 1
+            store["next_reply_id"] = 1
             store["pending"] = {}
             store["posted"] = {}
             store["user_profiles"] = {}
@@ -1337,8 +1338,8 @@ async def reply_command(update: Update,
 
         comment_text = " ".join(context.args[1:])
 
-        reply_id = store['next_id']
-        store["next_id"] += 1
+        reply_id = store.get('next_reply_id', 1)
+        store["next_reply_id"] = reply_id + 1
 
         posted_confession = store["posted"][conf_key]
         if "replies" not in posted_confession:
